@@ -725,29 +725,47 @@ fn client_loop(
         }
         match ws.read() {
             Ok(Message::Text(text)) if compression == RemoteCompression::None => {
-                if let Ok(frame) = decode_remote_text_frame(&text) {
-                    handle_frame(
-                        &app,
-                        &mut pending,
-                        frame,
-                        &remote_origin,
-                        &referrers,
-                        &event_owners,
-                        event_sink.as_ref(),
-                    );
+                match decode_remote_text_frame(&text) {
+                    Ok(frame) => {
+                        handle_frame(
+                            &app,
+                            &mut pending,
+                            frame,
+                            &remote_origin,
+                            &referrers,
+                            &event_owners,
+                            event_sink.as_ref(),
+                        );
+                    }
+                    Err(err) => {
+                        crate::commands::app::log_tauri(
+                            &app,
+                            &format!("[remote-client] invalid frame: {err}"),
+                        );
+                        break;
+                    }
                 }
             }
             Ok(Message::Binary(bytes)) if compression == RemoteCompression::Gzip => {
-                if let Ok(frame) = decode_remote_binary_frame(&bytes) {
-                    handle_frame(
-                        &app,
-                        &mut pending,
-                        frame,
-                        &remote_origin,
-                        &referrers,
-                        &event_owners,
-                        event_sink.as_ref(),
-                    );
+                match decode_remote_binary_frame(&bytes) {
+                    Ok(frame) => {
+                        handle_frame(
+                            &app,
+                            &mut pending,
+                            frame,
+                            &remote_origin,
+                            &referrers,
+                            &event_owners,
+                            event_sink.as_ref(),
+                        );
+                    }
+                    Err(err) => {
+                        crate::commands::app::log_tauri(
+                            &app,
+                            &format!("[remote-client] invalid frame: {err}"),
+                        );
+                        break;
+                    }
                 }
             }
             Ok(Message::Ping(bytes)) => {

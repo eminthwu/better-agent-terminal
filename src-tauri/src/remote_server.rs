@@ -57,6 +57,7 @@ const RUNTIME_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_INVOKE_TIMEOUT: Duration = Duration::from_secs(300);
 const CLAUDE_REMOTE_LOGIN_TTL: Duration = Duration::from_secs(180);
 const REMOTE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_SOCKET_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 const REMOTE_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -1180,6 +1181,58 @@ fn run_accept_loop(
     }
 }
 
+// Enforce an absolute deadline even while TLS or a fragmented WebSocket frame
+// keeps making progress. A per-read timeout alone permits indefinite slow drips.
+struct DeadlineTcpStream {
+    socket: TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl DeadlineTcpStream {
+    fn expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn timeout(&self, normal: Duration) -> io::Result<Duration> {
+        match self.deadline {
+            Some(deadline) => deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .map(|remaining| remaining.min(normal))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::TimedOut, "remote login deadline expired")
+                }),
+            None => Ok(normal),
+        }
+    }
+}
+
+impl Read for DeadlineTcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let timeout = if self.deadline.is_some() {
+            REMOTE_HANDSHAKE_TIMEOUT
+        } else {
+            REMOTE_SOCKET_POLL_TIMEOUT
+        };
+        self.socket
+            .set_read_timeout(Some(self.timeout(timeout)?))?;
+        self.socket.read(buf)
+    }
+}
+
+impl Write for DeadlineTcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.socket
+            .set_write_timeout(Some(self.timeout(REMOTE_SOCKET_WRITE_TIMEOUT)?))?;
+        self.socket.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.socket.flush()
+    }
+}
+
 fn handle_client(
     stream: TcpStream,
     config: Arc<ServerConfig>,
@@ -1206,16 +1259,18 @@ fn handle_client(
         .map_err(|err| format!("remote stream write timeout failed: {err}"))?;
     let connection =
         ServerConnection::new(config).map_err(|err| format!("remote TLS failed: {err}"))?;
-    let tls = StreamOwned::new(connection, stream);
+    let tls = StreamOwned::new(
+        connection,
+        DeadlineTcpStream {
+            socket: stream,
+            deadline: Some(Instant::now() + REMOTE_HANDSHAKE_TIMEOUT),
+        },
+    );
     let mut ws = accept_websocket_tls(tls)
         .map_err(|err| format!("remote websocket accept failed: {err}"))?;
-    ws.get_mut()
-        .sock
-        .set_read_timeout(Some(REMOTE_SOCKET_POLL_TIMEOUT))
-        .map_err(|err| format!("remote stream polling timeout failed: {err}"))?;
+    ws.get_mut().sock.deadline = Some(Instant::now() + REMOTE_AUTH_TIMEOUT);
     remote_debug_log(&ctx, format!("websocket accepted peer={peer}"));
     let mut authenticated = false;
-    let mut client_label = String::from("Remote Client");
     let mut client_id = String::new();
     let mut client_protocol = RemoteProtocol::LegacyV1;
     let mut client_compression = RemoteCompression::None;
@@ -1225,6 +1280,10 @@ fn handle_client(
     let _context_guard = ConnectionContextGuard(contexts.clone());
 
     loop {
+        if ws.get_ref().sock.expired() {
+            remote_debug_log(&ctx, format!("auth timed out peer={peer}"));
+            break;
+        }
         if close.load(Ordering::Acquire) {
             remote_debug_log(&ctx, format!("client revoked peer={peer}"));
             break;
@@ -1251,7 +1310,10 @@ fn handle_client(
             {
                 match decode_remote_text_frame(&text) {
                     Ok(frame) => frame,
-                    Err(_) => continue,
+                    Err(err) => {
+                        remote_debug_log(&ctx, format!("invalid frame peer={peer} error={err}"));
+                        break;
+                    }
                 }
             }
             Message::Binary(bytes)
@@ -1259,7 +1321,10 @@ fn handle_client(
             {
                 match decode_remote_binary_frame(&bytes) {
                     Ok(frame) => frame,
-                    Err(_) => continue,
+                    Err(err) => {
+                        remote_debug_log(&ctx, format!("invalid frame peer={peer} error={err}"));
+                        break;
+                    }
                 }
             }
             _ => continue,
@@ -1268,7 +1333,7 @@ fn handle_client(
         let id = frame.get("id").cloned().unwrap_or(Value::Null);
 
         if frame_type == "auth" {
-            if authenticated {
+            if authenticated || ws.get_ref().sock.expired() {
                 break;
             }
             let current_token = token.lock().map(|token| token.clone()).unwrap_or_default();
@@ -1345,7 +1410,7 @@ fn handle_client(
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let device_summary = format_client_device_summary(client_info.as_ref());
-            client_label = label.clone();
+            let client_label = label.clone();
             let device_id = client_info
                 .as_ref()
                 .and_then(|info| info.device_id.as_deref())
@@ -1384,6 +1449,7 @@ fn handle_client(
                 });
             }
             authenticated = true;
+            ws.get_mut().sock.deadline = None;
             remote_debug_log(&ctx,
                 format!(
                     "auth ok peer={peer} label={client_label}{device_summary} protocol={protocol_name} compression={}",
@@ -1528,11 +1594,9 @@ fn handle_client(
     let mut removed: Vec<RemoteClientInfo> = Vec::new();
     if let Ok(mut guard) = clients.lock() {
         guard.retain(|client| {
-            let keep = if client_id.is_empty() {
-                client.info.label != client_label
-            } else {
-                client.id != client_id
-            };
+            // An unauthenticated socket owns no record. Its timeout must not
+            // remove a valid client that happens to have the default label.
+            let keep = client.id != client_id;
             if !keep {
                 removed.push(client.info.clone());
             }
@@ -1612,6 +1676,102 @@ mod profile_context_integration_tests {
                 .to_string_lossy()
                 .starts_with("bat-profile-context-test-"));
             let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn unauthenticated_websockets_expire_and_release_slots_despite_pings() {
+        use rustls::pki_types::ServerName;
+        use rustls::{ClientConfig, ClientConnection, RootCertStore};
+        let host = TestHost::new();
+        let cert = ensure_remote_certificate(&host.dir).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(CertificateDer::from(cert.cert_der)).unwrap();
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let port = host.info["port"].as_u64().unwrap() as u16;
+        let connect = || {
+            let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            tcp.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            let tls = StreamOwned::new(
+                ClientConnection::new(config.clone(), ServerName::try_from("localhost").unwrap())
+                    .unwrap(),
+                tcp,
+            );
+            tungstenite::client(format!("wss://localhost:{port}/"), tls)
+                .unwrap()
+                .0
+        };
+        let mut valid = connect();
+        valid
+            .send(Message::Text(
+                json!({"type":"auth", "id":"a", "token":host.info["token"]})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+        let auth = valid.read().unwrap().into_text().unwrap();
+        assert_eq!(decode_remote_text_frame(&auth).unwrap()["result"], true);
+        let mut silent = connect();
+        let mut pinging = connect();
+        let (active, clients) = {
+            let guard = host.server.inner.lock().unwrap();
+            let server = guard.as_ref().unwrap();
+            (server.active_connections.clone(), server.clients.clone())
+        };
+        let deadline = Instant::now() + REMOTE_AUTH_TIMEOUT + Duration::from_secs(3);
+        while active.load(Ordering::Acquire) > 1 && Instant::now() < deadline {
+            if pinging.send(Message::Ping(Vec::new().into())).is_err() {
+                break;
+            }
+            if pinging.read().is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert!(
+            silent.read().is_err(),
+            "silent unauthenticated socket must be closed"
+        );
+        while active.load(Ordering::Acquire) > 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            1,
+            "expired clients must release capacity"
+        );
+        assert_eq!(
+            clients.lock().unwrap().len(),
+            1,
+            "timeouts must not remove the authenticated default-label client"
+        );
+        valid
+            .send(Message::Text(
+                json!({"type":"ping", "id":"still-alive"})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+        let reply_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(
+                Instant::now() < reply_deadline,
+                "authenticated client must still respond"
+            );
+            let reply = valid.read().unwrap().into_text().unwrap();
+            let reply = decode_remote_text_frame(&reply).unwrap();
+            // Startup/profile notifications may already be queued before pong.
+            if reply["type"] == "event" {
+                continue;
+            }
+            assert_eq!(reply["type"], "pong");
+            assert_eq!(reply["id"], "still-alive");
+            break;
         }
     }
 
@@ -1925,12 +2085,15 @@ fn log_remote_pty_write_frame(app: &HostContext, phase: &str, channel: &str, fra
 }
 
 fn accept_websocket_tls(
-    mut tls: StreamOwned<ServerConnection, TcpStream>,
-) -> Result<WebSocket<StreamOwned<ServerConnection, TcpStream>>, String> {
+    mut tls: StreamOwned<ServerConnection, DeadlineTcpStream>,
+) -> Result<WebSocket<StreamOwned<ServerConnection, DeadlineTcpStream>>, String> {
     let mut request = Vec::with_capacity(1024);
     let mut buf = [0_u8; 1024];
     let deadline = Instant::now() + REMOTE_HANDSHAKE_TIMEOUT;
     while request.len() < 16 * 1024 {
+        if tls.sock.expired() {
+            return Err("websocket request read timed out".to_string());
+        }
         let n = match tls.read(&mut buf) {
             Ok(n) => n,
             Err(err)
@@ -3804,6 +3967,36 @@ mod tests {
         assert_eq!(active.load(Ordering::Acquire), 2);
         drop((second, replacement));
         assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn login_deadline_bounds_partial_reads_and_can_be_cleared_after_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let mut stream = DeadlineTcpStream {
+            socket,
+            deadline: Some(Instant::now() + Duration::from_millis(100)),
+        };
+        let writer = thread::spawn(move || {
+            for _ in 0..12 {
+                peer.write_all(b"x").unwrap();
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let mut bytes = [0; 100];
+        assert_eq!(
+            stream.read_exact(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        while !stream.expired() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(stream.write(b"late").is_err());
+        stream.deadline = None;
+        assert!(!stream.expired());
+        assert!(stream.read(&mut bytes).unwrap() > 0);
+        writer.join().unwrap();
     }
 
     #[test]

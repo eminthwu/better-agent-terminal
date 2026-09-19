@@ -123,6 +123,17 @@ fn lexical_normalize(p: &Path) -> PathBuf {
             other => out.push(other.as_os_str()),
         }
     }
+    #[cfg(windows)]
+    {
+        // canonicalize returns verbatim paths on Windows. Compare those against
+        // ordinary drive/UNC paths with Windows' usual case-insensitive spelling.
+        let text = out.to_string_lossy().replace('/', "\\").to_lowercase();
+        if let Some(unc) = text.strip_prefix(r"\\?\unc\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        return PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
+    }
+    #[cfg(not(windows))]
     out
 }
 
@@ -181,6 +192,29 @@ pub fn is_sensitive_path(absolute_path: &str) -> bool {
     is_private_key_filename(&abs)
 }
 
+/// Resolve existing paths before a transfer, then use the returned path for I/O.
+/// Check both names: a credential store can itself be a symlink to another disk.
+pub fn resolve_transfer_path(path: &Path) -> Result<PathBuf, String> {
+    let absolute = std::path::absolute(path).map_err(|err| format!("bad path: {err}"))?;
+    if is_sensitive_path(&absolute.to_string_lossy()) {
+        return Err("access denied (sensitive path)".into());
+    }
+    let resolved =
+        std::fs::canonicalize(&absolute).map_err(|err| format!("cannot resolve path: {err}"))?;
+    if is_sensitive_path(&resolved.to_string_lossy()) {
+        return Err("access denied (sensitive path)".into());
+    }
+    let normalized = lexical_normalize(&resolved);
+    if denied_paths()
+        .iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .any(|denied| starts_with_denied(&normalized, &lexical_normalize(&denied)))
+    {
+        return Err("access denied (sensitive path)".into());
+    }
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +245,17 @@ mod tests {
         assert!(is_sensitive_path("/root/.bashrc"));
         // Sibling directory must NOT match.
         assert!(!is_sensitive_path("/rootless/foo"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_canonical_and_mixed_case_paths_are_guarded() {
+        assert!(is_sensitive_path(r"\\?\C:\WINDOWS\system32\CONFIG\SAM"));
+        assert!(is_sensitive_path(r"c:\windows\SYSTEM32\config\SAM"));
+        assert!(!is_sensitive_path(r"\\?\C:\Windows\System32\config-backup\notes.txt"));
+        assert_eq!(lexical_normalize(Path::new(r"\\?\UNC\Server\Share\keys\a.pem")),
+            lexical_normalize(Path::new(r"\\server\share\keys\a.pem")));
+        let home = home_dir().join(".ssh").join("id_ed25519");
+        assert!(is_sensitive_path(&format!(r"\\?\{}", home.display())));
     }
 }

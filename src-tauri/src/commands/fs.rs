@@ -13,7 +13,7 @@
 use crate::commands::profile as profile_cmd;
 use crate::event_hub::publish_runtime_event;
 use crate::host_context::HostContext;
-use crate::path_guard::is_sensitive_path;
+use crate::path_guard::{is_sensitive_path, resolve_transfer_path};
 use crate::remote_client::RustRemoteClientState;
 #[cfg(feature = "desktop")]
 use crate::window_registry;
@@ -1367,6 +1367,9 @@ fn create_unique_in_dir(dir: &Path, name: &str) -> Result<(fs::File, PathBuf), S
             format!("{stem}-{n}{ext}")
         };
         let candidate = dir.join(file_name);
+        if is_sensitive_path(&candidate.to_string_lossy()) {
+            return Err("upload: access denied (sensitive path)".into());
+        }
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1381,11 +1384,8 @@ fn create_unique_in_dir(dir: &Path, name: &str) -> Result<(fs::File, PathBuf), S
 }
 
 fn validated_dest_dir(dest_dir: &str) -> Result<PathBuf, String> {
-    let dir =
-        std::path::absolute(dest_dir).map_err(|err| format!("upload: bad destination: {err}"))?;
-    if is_sensitive_path(&dir.to_string_lossy()) {
-        return Err("upload: access denied (sensitive path)".into());
-    }
+    let dir = resolve_transfer_path(Path::new(dest_dir))
+        .map_err(|err| format!("upload: {err}"))?;
     if !dir.is_dir() {
         return Err("upload: destination is not a directory".into());
     }
@@ -1444,10 +1444,8 @@ pub(crate) fn fs_download_read_impl(path: String, offset: u64) -> Result<Value, 
     use base64::Engine as _;
     use std::io::{Read as _, Seek as _, SeekFrom};
 
-    let abs = std::path::absolute(&path).map_err(|err| format!("download: bad path: {err}"))?;
-    if is_sensitive_path(&abs.to_string_lossy()) {
-        return Err("download: access denied (sensitive path)".into());
-    }
+    let abs = resolve_transfer_path(Path::new(&path))
+        .map_err(|err| format!("download: {err}"))?;
     let meta = fs::metadata(&abs).map_err(|err| format!("download: stat failed: {err}"))?;
     if !meta.is_file() {
         return Err("download: not a file".into());
@@ -1486,18 +1484,15 @@ pub(crate) fn fs_download_read_impl(path: String, offset: u64) -> Result<Value, 
 // Local-mode upload: copy a picked local file into the destination directory
 // with the same collision-safe naming as the remote path.
 pub(crate) fn fs_copy_into_dir_impl(src: String, dest_dir: String) -> Result<String, String> {
-    let src_abs =
-        std::path::absolute(&src).map_err(|err| format!("upload: bad source path: {err}"))?;
-    if is_sensitive_path(&src_abs.to_string_lossy()) {
-        return Err("upload: access denied (sensitive path)".into());
-    }
+    let src_abs = resolve_transfer_path(Path::new(&src))
+        .map_err(|err| format!("upload: {err}"))?;
     let meta =
         fs::metadata(&src_abs).map_err(|err| format!("upload: cannot read local file: {err}"))?;
     if !meta.is_file() {
         return Err("upload: not a file".into());
     }
     let dir = validated_dest_dir(&dest_dir)?;
-    let name = src_abs
+    let name = Path::new(&src)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "upload".into());
@@ -1527,8 +1522,10 @@ fn stream_local_file_to_host(
     use base64::Engine as _;
     use std::io::Read as _;
 
+    let resolved = resolve_transfer_path(Path::new(local_path))
+        .map_err(|err| format!("upload: {err}"))?;
     {
-        let meta = fs::metadata(local_path)
+        let meta = fs::metadata(&resolved)
             .map_err(|err| format!("upload: cannot read local file: {err}"))?;
         if !meta.is_file() {
             return Err("upload: not a file".into());
@@ -1569,7 +1566,7 @@ fn stream_local_file_to_host(
             Err::<String, String>(reason)
         };
 
-        let mut file = match fs::File::open(&local_path) {
+        let mut file = match fs::File::open(&resolved) {
             Ok(f) => f,
             Err(err) => return abort(&remote_client, format!("upload: open failed: {err}")),
         };
@@ -1710,11 +1707,8 @@ pub async fn fs_download_file(
         if let Some((remote_client, window_label)) = remote {
             stream_host_file_to_local(&remote_client, &window_label, &source_path, &dest)?;
         } else {
-            let abs = std::path::absolute(&source_path)
-                .map_err(|err| format!("download: bad path: {err}"))?;
-            if is_sensitive_path(&abs.to_string_lossy()) {
-                return Err("download: access denied (sensitive path)".into());
-            }
+            let abs = resolve_transfer_path(Path::new(&source_path))
+                .map_err(|err| format!("download: {err}"))?;
             if !fs::metadata(&abs).map(|m| m.is_file()).unwrap_or(false) {
                 return Err("download: not a file".into());
             }
@@ -1918,6 +1912,109 @@ mod tests {
             1,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn transfers_resolve_directory_links_before_checking_sensitive_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "bat-transfer-links-{:032x}",
+            rand::random::<u128>()
+        ));
+        let keys = base.join("keys");
+        let vault = keys.join("vault.pem");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(keys.join("secret.pem"), b"test fixture only").unwrap();
+        fs::write(keys.join("notes.txt"), b"ordinary file").unwrap();
+        let alias = base.join("public");
+        let vault_alias = base.join("uploads");
+
+        fn link_dir(target: &Path, link: &Path) {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, link).unwrap();
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                // Junctions exercise the normal Windows case without requiring
+                // the elevated privilege needed for creating symbolic links.
+                let output = std::process::Command::new("powershell.exe")
+                    .args(["-NoProfile", "-NonInteractive", "-Command",
+                        "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:BAT_TEST_LINK -Target $env:BAT_TEST_TARGET | Out-Null"])
+                    .env("BAT_TEST_LINK", link).env("BAT_TEST_TARGET", target)
+                    .creation_flags(0x08000000)
+                    .output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        link_dir(&keys, &alias);
+        link_dir(&vault, &vault_alias);
+        let secret_alias = alias.join("secret.pem").to_string_lossy().into_owned();
+        assert!(
+            !is_sensitive_path(&secret_alias),
+            "fixture must exercise resolution"
+        );
+        assert!(fs_download_read_impl(secret_alias.clone(), 0)
+            .unwrap_err()
+            .contains("sensitive path"));
+        assert!(
+            fs_copy_into_dir_impl(secret_alias, base.to_string_lossy().into())
+                .unwrap_err()
+                .contains("sensitive path")
+        );
+        let state = FsUploadState::default();
+        assert!(fs_upload_begin_in_dir_impl(
+            &state,
+            vault_alias.to_string_lossy().into(),
+            "notes.txt".into(),
+            1
+        )
+        .unwrap_err()
+        .contains("sensitive path"));
+        assert!(fs_upload_begin_in_dir_impl(
+            &state,
+            alias.to_string_lossy().into(),
+            "new.pem".into(),
+            1
+        )
+        .unwrap_err()
+        .contains("sensitive path"));
+        assert!(!keys.join("new.pem").exists());
+        // Ordinary linked files/directories keep working, including the returned
+        // destination used for subsequent chunk writes and cleanup.
+        assert!(fs_download_read_impl(alias.join("notes.txt").to_string_lossy().into(), 0).is_ok());
+        let upload =
+            fs_upload_begin_in_dir_impl(&state, alias.to_string_lossy().into(), "ok.txt".into(), 1)
+                .unwrap();
+        assert_eq!(
+            Path::new(upload["path"].as_str().unwrap())
+                .parent()
+                .unwrap(),
+            fs::canonicalize(&keys).unwrap()
+        );
+        assert!(fs_upload_abort_impl(
+            &state,
+            upload["uploadId"].as_str().unwrap().into()
+        ));
+        #[cfg(windows)]
+        {
+            fs::remove_dir(&alias).unwrap();
+            fs::remove_dir(&vault_alias).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            fs::remove_file(&alias).unwrap();
+            fs::remove_file(&vault_alias).unwrap();
+        }
+        assert_eq!(base.parent(), Some(std::env::temp_dir().as_path()));
+        assert!(base
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("bat-transfer-links-"));
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

@@ -8,6 +8,8 @@ pub const REMOTE_PROTOCOL_V2: &str = "bat-remote/v2";
 pub const REMOTE_COMPRESSION_GZIP: &str = "gzip";
 pub const REMOTE_COMPRESSION_NONE: &str = "none";
 const REMOTE_GZIP_FRAME_MAGIC: &[u8] = b"BATGZIP1\0";
+// Match tungstenite's default message limit, including after decompression.
+const MAX_REMOTE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteProtocol {
@@ -97,19 +99,33 @@ pub fn encode_remote_frame(
 }
 
 pub fn decode_remote_text_frame(text: &str) -> Result<Value, String> {
+    if text.len() > MAX_REMOTE_FRAME_BYTES {
+        return Err("remote frame exceeds size limit".into());
+    }
     serde_json::from_str::<Value>(text)
         .map_err(|err| format!("remote frame json parse failed: {err}"))
 }
 
 pub fn decode_remote_binary_frame(bytes: &[u8]) -> Result<Value, String> {
+    if bytes.len() > MAX_REMOTE_FRAME_BYTES {
+        return Err("remote frame exceeds size limit".into());
+    }
+    decode_remote_binary_frame_with_limit(bytes, MAX_REMOTE_FRAME_BYTES)
+}
+
+fn decode_remote_binary_frame_with_limit(bytes: &[u8], limit: usize) -> Result<Value, String> {
     let Some(compressed) = bytes.strip_prefix(REMOTE_GZIP_FRAME_MAGIC) else {
         return Err("remote binary frame has unsupported envelope".to_string());
     };
-    let mut decoder = flate2::read::GzDecoder::new(compressed);
+    let decoder = flate2::read::GzDecoder::new(compressed);
     let mut raw = Vec::new();
     decoder
+        .take(limit as u64 + 1)
         .read_to_end(&mut raw)
         .map_err(|err| format!("remote frame gzip decode failed: {err}"))?;
+    if raw.len() > limit {
+        return Err("remote decompressed frame exceeds size limit".into());
+    }
     serde_json::from_slice::<Value>(&raw)
         .map_err(|err| format!("remote frame json parse failed: {err}"))
 }
@@ -1190,6 +1206,27 @@ mod tests {
         };
         assert_eq!(decode_remote_binary_frame(&bytes).unwrap(), frame);
         assert!(decode_remote_binary_frame(b"not-bat").is_err());
+    }
+
+    #[test]
+    fn compressed_frame_limit_applies_to_inflated_bytes() {
+        let frame = json!({"content": "x".repeat(128 * 1024)});
+        let raw_len = serde_json::to_vec(&frame).unwrap().len();
+        let RemoteFramePayload::Binary(bytes) =
+            encode_remote_frame(&frame, RemoteCompression::Gzip).unwrap()
+        else {
+            panic!("expected binary");
+        };
+        assert!(bytes.len() < 2048);
+        assert!(decode_remote_binary_frame_with_limit(&bytes, 2048)
+            .unwrap_err()
+            .contains("size limit"));
+        assert_eq!(
+            decode_remote_binary_frame_with_limit(&bytes, raw_len).unwrap(),
+            frame
+        );
+        assert!(decode_remote_binary_frame_with_limit(&bytes, raw_len - 1).is_err());
+        assert!(decode_remote_binary_frame_with_limit(&bytes[..bytes.len() - 4], raw_len).is_err());
     }
 
     #[test]
