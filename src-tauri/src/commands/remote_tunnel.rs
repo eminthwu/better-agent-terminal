@@ -155,8 +155,10 @@ fn spawn_tunnel(
         let app = app.clone();
         let key = key.to_string();
         std::thread::spawn(move || {
-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                let trimmed = line.trim_end().to_string();
+            // Windows ssh prints localized messages in the OEM code page;
+            // `lines()` would stop at the first non-UTF-8 line and drop it.
+            for line in BufReader::new(stream).split(b'\n').map_while(Result::ok) {
+                let trimmed = String::from_utf8_lossy(&line).trim_end().to_string();
                 if trimmed.is_empty() {
                     continue;
                 }
@@ -181,6 +183,24 @@ fn spawn_tunnel(
     })
 }
 
+/// The field is documented as an ssh destination, but "ssh ap01" or
+/// "ssh user@host" is what people paste from a shell; drop the leading word.
+pub fn normalize_ssh_target(raw: &str) -> Option<String> {
+    let mut tokens = raw.split_whitespace().peekable();
+    if let Some(first) = tokens.peek() {
+        let lower = first.to_ascii_lowercase();
+        if lower == "ssh" || lower == "ssh.exe" {
+            tokens.next();
+        }
+    }
+    let value = tokens.collect::<Vec<_>>().join(" ");
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 fn tunnel_key(spec: &RemoteTunnelSpec, target: &str, host: &str, port: u16) -> String {
     match spec.profile_id.as_deref().filter(|id| !id.trim().is_empty()) {
         Some(id) => format!("profile:{id}"),
@@ -202,8 +222,8 @@ fn resolve_spec(app: &AppHandle, spec: &RemoteTunnelSpec) -> Result<(Option<Stri
             .unwrap_or(9876);
         let target = profile
             .ssh_target
-            .clone()
-            .filter(|value| !value.trim().is_empty());
+            .as_deref()
+            .and_then(normalize_ssh_target);
         return Ok((target, host, port));
     }
     let host = spec
@@ -212,10 +232,7 @@ fn resolve_spec(app: &AppHandle, spec: &RemoteTunnelSpec) -> Result<(Option<Stri
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "127.0.0.1".into());
     let port = spec.remote_port.unwrap_or(9876);
-    let target = spec
-        .ssh_target
-        .clone()
-        .filter(|value| !value.trim().is_empty());
+    let target = spec.ssh_target.as_deref().and_then(normalize_ssh_target);
     Ok((target, host, port))
 }
 
@@ -462,6 +479,15 @@ mod tests {
         assert!(args.contains(&"BatchMode=yes".to_string()));
         assert!(args.contains(&"ExitOnForwardFailure=yes".to_string()));
         assert!(args.contains(&"-N".to_string()));
+    }
+
+    #[test]
+    fn ssh_target_drops_leading_ssh_word() {
+        assert_eq!(normalize_ssh_target("ssh ap01").as_deref(), Some("ap01"));
+        assert_eq!(normalize_ssh_target("  SSH  user@host ").as_deref(), Some("user@host"));
+        assert_eq!(normalize_ssh_target("ap01").as_deref(), Some("ap01"));
+        assert_eq!(normalize_ssh_target("ssh"), None);
+        assert_eq!(normalize_ssh_target("   "), None);
     }
 
     #[test]
