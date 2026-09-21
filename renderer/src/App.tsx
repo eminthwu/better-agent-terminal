@@ -194,7 +194,10 @@ export default function App() {
   // Connection params captured on the initial remote connect so the status
   // poll can silently re-dial after an idle drop without re-reading the
   // profile. Null for local profiles / before the first remote connect.
-  const remoteConnParamsRef = useRef<{ host: string; port: number; token: string; fingerprint: string } | null>(null)
+  // `tunnelProfileId` is set for profiles with an sshTarget: every dial
+  // (initial and reconnect) first re-ensures the client-side SSH forward and
+  // dials whatever local port it reports.
+  const remoteConnParamsRef = useRef<{ host: string; port: number; token: string; fingerprint: string; tunnelProfileId?: string } | null>(null)
   // Auto-reconnect backoff state. `inFlight` prevents overlapping dials;
   // `nextAt` gates retries (epoch ms); `backoff` grows on failure.
   const reconnectRef = useRef<{ inFlight: boolean; backoff: number; nextAt: number }>({ inFlight: false, backoff: RECONNECT_BACKOFF_MIN, nextAt: 0 })
@@ -620,7 +623,8 @@ export default function App() {
 
         if (active?.type === 'remote' && active.remoteHost && active.remoteToken && active.remoteFingerprint) {
           const remoteProfileId = active.remoteProfileId || 'default'
-          const remoteOrigin = `${active.remoteHost}:${active.remotePort || 9876}`
+          const sshTarget: string | undefined = (typeof active.sshTarget === 'string' && active.sshTarget.trim()) ? active.sshTarget.trim() : undefined
+          const remoteOrigin = `${sshTarget ? `ssh ${sshTarget} → ` : ''}${active.remoteHost}:${active.remotePort || 9876}`
           const remoteDisplayName = (typeof active.remoteProfileName === 'string' && active.remoteProfileName.trim())
             ? active.remoteProfileName.trim()
             : active.name
@@ -644,13 +648,42 @@ export default function App() {
             port: active.remotePort || 9876,
             token: active.remoteToken,
             fingerprint: active.remoteFingerprint,
+            tunnelProfileId: sshTarget ? active.id : undefined,
           }
+          // With an sshTarget the host:port describe the bat-server as seen
+          // from the SSH server; open (or reuse) the local forward and dial it.
+          let dialHost: string = active.remoteHost
+          let dialPort: number = active.remotePort || 9876
+          if (sshTarget) {
+            const tTunnel = performance.now()
+            const endpoint = await host.remoteTunnel.ensure({ profileId: active.id }).catch((err: unknown) => ({
+              ready: false, tunneled: true, host: '', port: 0, spawned: false, error: String(err),
+            }))
+            dlog(`[init] remote tunnel ssh=${sshTarget} ready=${endpoint.ready} port=${endpoint.port} spawned=${endpoint.spawned} ${(performance.now() - tTunnel).toFixed(0)}ms${endpoint.error ? ` error=${endpoint.error}` : ''}`)
+            if (!endpoint.ready) {
+              setProfileStartup({
+                phase: 'error',
+                target: remoteStartupTarget,
+                message: t('app.remoteTunnelFailed', {
+                  target: sshTarget,
+                  error: [endpoint.error, endpoint.output].filter(Boolean).join('\n'),
+                }),
+              })
+              return
+            }
+            dialHost = endpoint.host
+            dialPort = endpoint.port
+            remoteConnParamsRef.current = { ...remoteConnParamsRef.current, host: dialHost, port: dialPort }
+          }
+          // The Rust client tags every event with the origin it actually
+          // dialed, so the viewed origin must be the dial endpoint.
+          const dialOrigin = `${dialHost}:${dialPort}`
           // Try connecting to remote
           const tRemote = performance.now()
-          dlog(`[init] remote.connect start host=${remoteOrigin} profile=${remoteProfileId}`)
+          dlog(`[init] remote.connect start host=${dialOrigin} profile=${remoteProfileId}`)
           const connectResult = await host.remote.connect(
-            active.remoteHost,
-            active.remotePort || 9876,
+            dialHost,
+            dialPort,
             active.remoteToken,
             active.remoteFingerprint
           )
@@ -660,7 +693,7 @@ export default function App() {
             // blank (the reason was previously swallowed on the restore path,
             // leaving only an unrelated "not connected" unhandledrejection in
             // the log). Logged for every path, including the local fallback.
-            dlog(`[init] remote.connect failed host=${active.remoteHost}:${active.remotePort || 9876} error=${String((connectResult as { error?: unknown }).error)}`)
+            dlog(`[init] remote.connect failed host=${dialOrigin} error=${String((connectResult as { error?: unknown }).error)}`)
             // Keep the reason visible. Closing this window automatically after
             // two seconds made a failed dial indistinguishable from a routing bug.
             setProfileStartup({
@@ -675,7 +708,7 @@ export default function App() {
             // arrives immediately after the socket connects can never fall through
             // to the local windowId branch (see workspace-store.listenForReload).
             workspaceStore.setViewedRemoteProfileId(active.remoteProfileId || 'default')
-            workspaceStore.setViewedRemoteOrigin(`${active.remoteHost}:${active.remotePort || 9876}`)
+            workspaceStore.setViewedRemoteOrigin(dialOrigin)
             const winIdx = await host.app.getWindowIndex()
             // Show the HOST-side target profile name when we have it (persisted on
             // the alias at selection time) so the title/sidebar reflect which
@@ -685,7 +718,7 @@ export default function App() {
             setActiveProfileIsRemote(true)
             setActiveProfileId(active.id)
             setActiveRemoteProfileId(active.remoteProfileId || 'default')
-            setActiveRemoteOrigin(`${active.remoteHost}:${active.remotePort || 9876}`)
+            setActiveRemoteOrigin(dialOrigin)
             setRemoteClientConnected(true)
             // Surface client/server app version skew once per fresh connect.
             // A 3.1.22 host silently accepting 3.1.26 clients was the trigger
@@ -880,6 +913,15 @@ export default function App() {
       if (Date.now() < state.nextAt) return
       state.inFlight = true
       try {
+        if (params.tunnelProfileId) {
+          // The forward may have died with the connection; bring it back
+          // first (a dead ssh is respawned, a live one is reused) and dial
+          // whichever local port it reports this time.
+          const endpoint = await host.remoteTunnel.ensure({ profileId: params.tunnelProfileId })
+          if (!endpoint.ready) throw new Error(endpoint.error || 'ssh tunnel not ready')
+          params.host = endpoint.host
+          params.port = endpoint.port
+        }
         const result = await host.remote.connect(params.host, params.port, params.token, params.fingerprint)
         const failed = !result || (typeof result === 'object' && 'error' in (result as Record<string, unknown>))
         if (failed) {

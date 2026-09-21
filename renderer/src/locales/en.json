@@ -27,6 +27,7 @@
     "loadingProfile": "Loading profile…",
     "remoteConnecting": "Connecting to remote profile…",
     "remoteConnectionFailed": "Remote connection failed: {{error}}",
+    "remoteTunnelFailed": "SSH tunnel to {{target}} failed: {{error}}",
     "remoteConnectionFailedFallback": "Remote connection failed: {{error}}\nSwitching back to local profile.",
     "remoteMissingInfo": "Remote profile is missing connection info.",
     "remoteVersionMismatch": "Connected to remote host running a different version (client {{clientVersion}} vs server {{serverVersion}}). Mismatched versions can corrupt shared workspace state (see issue #115); update the older side when convenient."
@@ -274,6 +275,8 @@
     "connectionUrlPlaceholder": "Paste connection URL (wss://host:port?token=…&fp=…)",
     "hostPlaceholder": "Host (e.g. 192.168.1.100)",
     "portPlaceholder": "Port",
+    "sshTargetPlaceholder": "SSH tunnel (optional): ssh target, e.g. ap01 or user@host",
+    "sshTargetHint": "When set, BAT opens \"ssh -N -L <local>:<host>:<port> <target>\" on this machine before connecting and picks a free local port itself. Host and port then describe the bat-server as seen from the SSH server (usually 127.0.0.1:9876).",
     "tokenPlaceholder": "Token",
     "remote": "REMOTE",
     "updated": "Updated {{date}}",

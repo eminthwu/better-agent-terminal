@@ -62,6 +62,13 @@ pub struct ProfileEntry {
     // the host later renames the profile.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_profile_name: Option<String>,
+    // Optional SSH destination (a ~/.ssh/config alias or user@host). When set,
+    // the client opens `ssh -N -L <free>:<remote_host>:<remote_port>` on this
+    // machine before dialing and connects through the forwarded local port,
+    // so remote_host/remote_port describe the bat-server as seen from the SSH
+    // server (usually 127.0.0.1:9876).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_target: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -95,6 +102,7 @@ pub struct CreateProfileOptions {
     pub remote_fingerprint: Option<String>,
     pub remote_profile_id: Option<String>,
     pub remote_profile_name: Option<String>,
+    pub ssh_target: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -106,6 +114,8 @@ pub struct UpdateProfileOptions {
     pub remote_fingerprint: Option<String>,
     pub remote_profile_id: Option<String>,
     pub remote_profile_name: Option<String>,
+    /// `Some("")` clears the SSH target.
+    pub ssh_target: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -137,6 +147,7 @@ fn default_entry() -> ProfileEntry {
         remote_fingerprint: None,
         remote_profile_id: None,
         remote_profile_name: None,
+        ssh_target: None,
         created_at: 0,
         updated_at: 0,
     }
@@ -652,6 +663,10 @@ fn profile_from_options(
         remote_fingerprint: options.remote_fingerprint,
         remote_profile_id: options.remote_profile_id,
         remote_profile_name: options.remote_profile_name,
+        ssh_target: options
+            .ssh_target
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
         created_at: now,
         updated_at: now,
     }
@@ -1443,6 +1458,10 @@ pub fn profile_update(
         if updates.remote_profile_name.is_some() {
             profile.remote_profile_name = updates.remote_profile_name;
         }
+        if let Some(value) = updates.ssh_target {
+            let trimmed = value.trim().to_string();
+            profile.ssh_target = if trimmed.is_empty() { None } else { Some(trimmed) };
+        }
         if profile.remote_host.is_some() || profile.remote_fingerprint.is_some() {
             profile.kind = "remote".into();
         }
@@ -1734,6 +1753,7 @@ mod tests {
                 remote_fingerprint: Some("AA".into()),
                 remote_profile_id: Some("default".into()),
                 remote_profile_name: None,
+                ssh_target: None,
             }),
         );
         write_index_at(
@@ -1786,6 +1806,7 @@ mod tests {
                 remote_fingerprint: Some("AA".into()),
                 remote_profile_id: Some("default".into()),
                 remote_profile_name: None,
+                ssh_target: None,
             }),
         );
 

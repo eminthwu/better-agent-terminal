@@ -953,6 +953,7 @@ mod tests {
             remote_fingerprint: None,
             remote_profile_id: None,
             remote_profile_name: None,
+            ssh_target: None,
             created_at: 0,
             updated_at: 0,
         }

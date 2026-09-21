@@ -26,6 +26,7 @@
     "loadingProfile": "正在加载配置文件…",
     "remoteConnecting": "正在连接远程配置文件…",
     "remoteConnectionFailed": "远程连接失败：{{error}}",
+    "remoteTunnelFailed": "到 {{target}} 的 SSH 隧道建立失败：{{error}}",
     "remoteConnectionFailedFallback": "远程连接失败：{{error}}\n正在切换回本地配置文件。",
     "remoteMissingInfo": "远程配置文件缺少连接信息。",
     "remoteVersionMismatch": "已连接到版本不同的远程主机（client {{clientVersion}} vs server {{serverVersion}}）。版本不一致可能会污染共享的工作区状态（见 issue #115），方便时请更新较旧的那一端。"
@@ -266,6 +267,8 @@
     "connectionUrlPlaceholder": "粘贴连接网址（wss://host:port?token=…&fp=…）",
     "hostPlaceholder": "主机（例如 192.168.1.100）",
     "portPlaceholder": "端口",
+    "sshTargetPlaceholder": "SSH 隧道（可选）：ssh 目标，例如 ap01 或 user@host",
+    "sshTargetHint": "设置后，BAT 会在连接前于本机执行“ssh -N -L <本地端口>:<主机>:<端口> <目标>”，本地端口自动选择。此时主机与端口是指从 SSH 服务器看到的 bat-server（通常是 127.0.0.1:9876）。",
     "tokenPlaceholder": "Token",
     "remote": "远程",
     "updated": "更新于 {{date}}",

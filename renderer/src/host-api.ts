@@ -14,6 +14,16 @@ import { dispatchTauriNativeDrop } from './utils/tauri-native-drop'
 
 type BatAppAPI = any
 
+export interface RemoteTunnelEndpoint {
+  ready: boolean
+  tunneled: boolean
+  host: string
+  port: number
+  spawned: boolean
+  error?: string
+  output?: string
+}
+
 export type HostKind = 'tauri' | 'unknown'
 
 interface TauriInternals { __TAURI_INTERNALS__?: unknown; __TAURI__?: unknown }
@@ -1550,6 +1560,16 @@ function createTauriHost(): BatAppAPI {
       listProfiles: (host: string, port: number, token: string, fingerprint: string) =>
         getInvoke()<unknown>('remote_list_profiles', { host, port, token, fingerprint }),
     },
+    remoteTunnel: {
+      // Client-side SSH port forward for remote profiles with an sshTarget.
+      // Returns the endpoint to dial (the forwarded local port, or the
+      // profile's own host:port when no tunnel is configured).
+      ensure: (spec: { profileId?: string; sshTarget?: string; remoteHost?: string; remotePort?: number }) =>
+        getInvoke()<RemoteTunnelEndpoint>('remote_tunnel_ensure', { spec }),
+      stop: (profileId: string) => getInvoke()<boolean>('remote_tunnel_stop', { profileId }),
+      status: (profileId: string) =>
+        getInvoke()<{ running: boolean; port?: number; uptimeSeconds?: number; output?: string | null }>('remote_tunnel_status', { profileId }),
+    },
     tunnel: {
       getConnection: () => getInvoke()<unknown>('tunnel_get_connection'),
     },
@@ -1665,7 +1685,7 @@ const PORTED_NAMESPACES = new Set([
   'pty', 'workspace', 'update', 'debug', 'git', 'app',
   'notification', 'system', 'github', 'snippet', 'profile',
   'claude', 'claudeChannel', 'claudeCli', 'remoteFs', 'worktree', 'agent', 'workerBuffer',
-  'remote', 'tunnel',
+  'remote', 'tunnel', 'remoteTunnel',
 ])
 
 export function installTauriShim(): void {

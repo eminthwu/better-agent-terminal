@@ -13,6 +13,7 @@ interface ProfileEntry {
   remoteFingerprint?: string
   remoteProfileId?: string
   remoteProfileName?: string
+  sshTarget?: string
   createdAt: number
   updatedAt: number
 }
@@ -41,6 +42,7 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
   const [remotePort, setRemotePort] = useState('9876')
   const [remoteToken, setRemoteToken] = useState('')
   const [remoteFingerprint, setRemoteFingerprint] = useState('')
+  const [remoteSshTarget, setRemoteSshTarget] = useState('')
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editValue, setEditValue] = useState('')
   const [editingRemoteId, setEditingRemoteId] = useState<string | null>(null)
@@ -49,6 +51,7 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
   const [editRemotePort, setEditRemotePort] = useState('')
   const [editRemoteToken, setEditRemoteToken] = useState('')
   const [editRemoteFingerprint, setEditRemoteFingerprint] = useState('')
+  const [editRemoteSshTarget, setEditRemoteSshTarget] = useState('')
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   const [testingId, setTestingId] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<Record<string, 'ok' | 'fail' | 'testing'>>({})
@@ -157,8 +160,22 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
     return () => window.removeEventListener('keydown', handler)
   }, [creating, editingId, confirmDelete, siblingSourceId, onClose])
 
-  const fetchRemoteProfileList = async (remoteHost: string, port: number, token: string, fingerprint: string): Promise<RemoteProfileOption[]> => {
-    const result = await host.remote.listProfiles(remoteHost, port, token, fingerprint)
+  // Resolve where to dial: through a client-side SSH forward when the
+  // profile (or the form) names an sshTarget, otherwise host:port directly.
+  const resolveDialEndpoint = async (spec: { profileId?: string; sshTarget?: string; remoteHost: string; remotePort: number }) => {
+    if (!spec.profileId && !spec.sshTarget) return { host: spec.remoteHost, port: spec.remotePort }
+    const endpoint = await host.remoteTunnel.ensure(spec.profileId ? { profileId: spec.profileId } : {
+      sshTarget: spec.sshTarget, remoteHost: spec.remoteHost, remotePort: spec.remotePort,
+    })
+    if (!endpoint.ready) {
+      throw new Error([endpoint.error || 'ssh tunnel not ready', endpoint.output].filter(Boolean).join('\n'))
+    }
+    return { host: endpoint.host, port: endpoint.port }
+  }
+
+  const fetchRemoteProfileList = async (remoteHost: string, port: number, token: string, fingerprint: string, tunnel?: { profileId?: string; sshTarget?: string }): Promise<RemoteProfileOption[]> => {
+    const dial = await resolveDialEndpoint({ ...tunnel, remoteHost, remotePort: port })
+    const result = await host.remote.listProfiles(dial.host, dial.port, token, fingerprint)
     if ('error' in result) throw new Error(result.error)
     return result.profiles
   }
@@ -168,7 +185,7 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
     setFetchingRemoteProfiles(true)
     setRemoteProfileError('')
     try {
-      const profiles = await fetchRemoteProfileList(remoteHost.trim(), parseInt(remotePort) || 9876, remoteToken.trim(), remoteFingerprint.trim())
+      const profiles = await fetchRemoteProfileList(remoteHost.trim(), parseInt(remotePort) || 9876, remoteToken.trim(), remoteFingerprint.trim(), { sshTarget: remoteSshTarget.trim() || undefined })
       setRemoteProfiles(profiles)
       // Auto-select default or first
       const defaultP = profiles.find(p => p.id === 'default') || profiles[0]
@@ -195,6 +212,7 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
         remoteFingerprint: remoteFingerprint.trim(),
         remoteProfileId: selectedRemoteProfileId,
         remoteProfileName: remoteProfiles.find(p => p.id === selectedRemoteProfileId)?.name,
+        sshTarget: remoteSshTarget.trim() || undefined,
       })
     } else {
       await host.profile.create(trimmed)
@@ -205,6 +223,7 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
     setRemotePort('9876')
     setRemoteToken('')
     setRemoteFingerprint('')
+    setRemoteSshTarget('')
     setRemoteProfiles([])
     setSelectedRemoteProfileId('')
     loadProfiles()
@@ -227,6 +246,7 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
     setEditRemotePort(String(profile.remotePort || 9876))
     setEditRemoteToken(profile.remoteToken || '')
     setEditRemoteFingerprint(profile.remoteFingerprint || '')
+    setEditRemoteSshTarget(profile.sshTarget || '')
     setEditRemoteProfiles([])
     setEditSelectedRemoteProfileId(profile.remoteProfileId || '')
     setEditRemoteProfileError('')
@@ -237,7 +257,7 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
     setEditFetchingRemoteProfiles(true)
     setEditRemoteProfileError('')
     try {
-      const profiles = await fetchRemoteProfileList(editRemoteHost.trim(), parseInt(editRemotePort) || 9876, editRemoteToken.trim(), editRemoteFingerprint.trim())
+      const profiles = await fetchRemoteProfileList(editRemoteHost.trim(), parseInt(editRemotePort) || 9876, editRemoteToken.trim(), editRemoteFingerprint.trim(), { sshTarget: editRemoteSshTarget.trim() || undefined })
       setEditRemoteProfiles(profiles)
       // Keep current selection if still valid, else auto-select
       if (!profiles.some(p => p.id === editSelectedRemoteProfileId)) {
@@ -272,6 +292,8 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
       // Only refresh the cached name when we have the fetched profile list;
       // otherwise leave the stored name untouched (undefined => unchanged).
       remoteProfileName: editRemoteProfiles.find(p => p.id === editSelectedRemoteProfileId)?.name,
+      // Empty string clears the SSH target on the host side.
+      sshTarget: editRemoteSshTarget.trim(),
     })
     setEditingRemoteId(null)
     setEditRemoteProfiles([])
@@ -296,9 +318,14 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
     setTestingId(profile.id)
     setTestResult(prev => ({ ...prev, [profile.id]: 'testing' }))
     try {
+      const dial = await resolveDialEndpoint({
+        profileId: profile.sshTarget ? profile.id : undefined,
+        remoteHost: profile.remoteHost,
+        remotePort: profile.remotePort || 9876,
+      })
       const result = await host.remote.testConnection(
-        profile.remoteHost,
-        profile.remotePort || 9876,
+        dial.host,
+        dial.port,
         profile.remoteToken,
         profile.remoteFingerprint
       )
@@ -321,7 +348,8 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
         profile.remoteHost,
         profile.remotePort || 9876,
         profile.remoteToken,
-        profile.remoteFingerprint
+        profile.remoteFingerprint,
+        { profileId: profile.sshTarget ? profile.id : undefined }
       )
       const currentTargetId = profile.remoteProfileId || 'default'
       setSiblingProfiles(profiles.filter(rp => rp.id !== currentTargetId))
@@ -472,6 +500,15 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
                     onChange={e => { setRemoteFingerprint(e.target.value); setRemoteProfiles([]); setSelectedRemoteProfileId('') }}
                     style={{ width: '100%', fontFamily: 'monospace', fontSize: 11 }}
                   />
+                  <input
+                    type="text"
+                    className="profile-name-input"
+                    placeholder={t('profiles.sshTargetPlaceholder')}
+                    title={t('profiles.sshTargetHint')}
+                    value={remoteSshTarget}
+                    onChange={e => { setRemoteSshTarget(e.target.value); setRemoteProfiles([]); setSelectedRemoteProfileId('') }}
+                    style={{ width: '100%', fontFamily: 'monospace', fontSize: 11 }}
+                  />
                   <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                     <button
                       className="profile-action-btn"
@@ -553,7 +590,7 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
                       </span>
                       <span className="profile-item-meta">
                         {profile.type === 'remote'
-                          ? `${profile.remoteHost}:${profile.remotePort}${profile.remoteProfileId ? ` → ${profile.remoteProfileId}` : ''}`
+                          ? `${profile.sshTarget ? `ssh ${profile.sshTarget} → ` : ''}${profile.remoteHost}:${profile.remotePort}${profile.remoteProfileId ? ` → ${profile.remoteProfileId}` : ''}`
                           : t('profiles.updated', { date: formatDate(profile.updatedAt) })}
                       </span>
                     </>
@@ -693,6 +730,15 @@ export function ProfilePanel({ onClose, onSwitchNewWindow, onProfileRenamed }: P
                       placeholder={t('profiles.fingerprintPlaceholder', 'Cert fingerprint (SHA-256)')}
                       value={editRemoteFingerprint}
                       onChange={e => { setEditRemoteFingerprint(e.target.value); setEditRemoteProfiles([]); setEditRemoteProfileError('') }}
+                      style={{ flex: '1 1 100%', fontFamily: 'monospace', fontSize: 11 }}
+                    />
+                    <input
+                      type="text"
+                      className="profile-name-input"
+                      placeholder={t('profiles.sshTargetPlaceholder')}
+                      title={t('profiles.sshTargetHint')}
+                      value={editRemoteSshTarget}
+                      onChange={e => { setEditRemoteSshTarget(e.target.value); setEditRemoteProfiles([]); setEditRemoteProfileError('') }}
                       style={{ flex: '1 1 100%', fontFamily: 'monospace', fontSize: 11 }}
                     />
                     <div style={{ display: 'flex', gap: 6, width: '100%', alignItems: 'center' }}>

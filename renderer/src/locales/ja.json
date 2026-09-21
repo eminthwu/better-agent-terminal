@@ -26,6 +26,7 @@
     "loadingProfile": "プロファイルを読み込んでいます…",
     "remoteConnecting": "リモートプロファイルに接続しています…",
     "remoteConnectionFailed": "リモート接続に失敗しました: {{error}}",
+    "remoteTunnelFailed": "{{target}} への SSH トンネルの確立に失敗しました: {{error}}",
     "remoteConnectionFailedFallback": "リモート接続に失敗しました: {{error}}\nローカルプロファイルに切り替えます。",
     "remoteMissingInfo": "リモートプロファイルに接続情報がありません。",
     "remoteVersionMismatch": "異なるバージョンを実行しているリモートホストに接続しました（クライアント {{clientVersion}} とサーバー {{serverVersion}}）。バージョンが一致していないと、共有ワークスペースの状態が破損する可能性があります（issue #115 を参照）。都合のよいタイミングで古い側を更新してください。"
@@ -268,6 +269,8 @@
     "connectionUrlPlaceholder": "接続URLを貼り付け (wss://host:port?token=…&fp=…)",
     "hostPlaceholder": "ホスト (例: 192.168.1.100)",
     "portPlaceholder": "ポート",
+    "sshTargetPlaceholder": "SSH トンネル（任意）: ssh の接続先、例: ap01 または user@host",
+    "sshTargetHint": "設定すると、接続前にこのマシンで「ssh -N -L <ローカルポート>:<ホスト>:<ポート> <接続先>」を実行し、ローカルポートは自動で選びます。ホストとポートは SSH サーバーから見た bat-server（通常 127.0.0.1:9876）を指します。",
     "tokenPlaceholder": "トークン",
     "remote": "リモート",
     "updated": "更新日時 {{date}}",

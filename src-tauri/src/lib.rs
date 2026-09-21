@@ -52,7 +52,8 @@ use commands::{
     claude_cli as claude_cli_cmd, clipboard as clipboard_cmd, debug as debug_cmd,
     dialog as dialog_cmd, fs as fs_cmd, fugu as fugu_cmd, git as git_cmd, github as github_cmd,
     image as image_cmd, notification as notification_cmd, profile as profile_cmd, pty as pty_cmd,
-    remote as remote_cmd, runtime as runtime_cmd, settings, shell as shell_cmd,
+    remote as remote_cmd, remote_tunnel as remote_tunnel_cmd, runtime as runtime_cmd, settings,
+    shell as shell_cmd,
     snippet as snippet_cmd, tunnel as tunnel_cmd, update as update_cmd,
     worker_buffer as worker_buffer_cmd, workspace as workspace_cmd, worktree as worktree_cmd,
 };
@@ -162,6 +163,11 @@ pub fn run(context: tauri::Context<tauri::Wry>) {
             codex_app_server::snapshot_active_identity_on_exit(
                 &crate::host_context::HostContext::from_app(app_handle.clone()),
             );
+            // ssh children outlive the app otherwise (Windows does not kill
+            // them with the parent); no window is left to own them.
+            if let Some(state) = app_handle.try_state::<remote_tunnel_cmd::RemoteTunnelState>() {
+                remote_tunnel_cmd::stop_all_tunnels(app_handle, &state);
+            }
         }
     });
 }
@@ -183,6 +189,7 @@ fn app_builder(headless: bool) -> tauri::Builder<tauri::Wry> {
         .manage(fs_cmd::FsUploadState::default())
         .manage(snippet_cmd::SnippetState::default())
         .manage(worker_buffer_cmd::WorkerBufferState::default())
+        .manage(remote_tunnel_cmd::RemoteTunnelState::default())
         .manage(worktree_cmd::WorktreeState::default())
         .manage(event_hub::RuntimeEventHubState::default())
         .manage(remote_client::RustRemoteClientState::default())
@@ -194,6 +201,7 @@ fn app_builder(headless: bool) -> tauri::Builder<tauri::Wry> {
             if let Some(data_dir) = app_data::app_data_dir_opt(app.handle()) {
                 panic_log::install(data_dir);
             }
+            remote_tunnel_cmd::start_reaper(app.handle().clone());
             if !headless {
                 // Tier 2 is the default: recover from an interrupted swap and
                 // auto-migrate legacy multi-HOME Codex accounts into the unified
@@ -457,6 +465,9 @@ fn app_builder(headless: bool) -> tauri::Builder<tauri::Wry> {
             remote_cmd::remote_test_connection,
             remote_cmd::remote_list_profiles,
             tunnel_cmd::tunnel_get_connection,
+            remote_tunnel_cmd::remote_tunnel_ensure,
+            remote_tunnel_cmd::remote_tunnel_stop,
+            remote_tunnel_cmd::remote_tunnel_status,
         ])
 }
 

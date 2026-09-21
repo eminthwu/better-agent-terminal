@@ -27,6 +27,7 @@
     "loadingProfile": "正在載入設定檔…",
     "remoteConnecting": "正在連線至遠端設定檔…",
     "remoteConnectionFailed": "遠端連線失敗：{{error}}",
+    "remoteTunnelFailed": "到 {{target}} 的 SSH 通道建立失敗：{{error}}",
     "remoteConnectionFailedFallback": "遠端連線失敗：{{error}}\n正在切換回本機設定檔。",
     "remoteMissingInfo": "遠端設定檔缺少連線資訊。",
     "remoteVersionMismatch": "已連線至版本不同的遠端主機（client {{clientVersion}} vs server {{serverVersion}}）。版本不一致可能會污染共用的工作區狀態（見 issue #115），方便時請更新較舊的那一端。"
@@ -274,6 +275,8 @@
     "connectionUrlPlaceholder": "貼上連線網址（wss://host:port?token=…&fp=…）",
     "hostPlaceholder": "主機（例如 192.168.1.100）",
     "portPlaceholder": "連接埠",
+    "sshTargetPlaceholder": "SSH 通道（選填）：ssh 目標，例如 ap01 或 user@host",
+    "sshTargetHint": "設定後，BAT 會在連線前於這台機器執行「ssh -N -L <本機埠>:<主機>:<埠> <目標>」，本機埠自動挑選。此時主機與連接埠是指從 SSH 伺服器看到的 bat-server（通常是 127.0.0.1:9876）。",
     "tokenPlaceholder": "Token",
     "remote": "遠端",
     "updated": "更新於 {{date}}",
