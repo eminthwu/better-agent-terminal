@@ -147,7 +147,7 @@ Items can be reordered, colored, and toggled on/off via a drag-and-drop template
 
 ### Codex Agent
 
-Optional alternate agent backend powered by [`@openai/codex-sdk`](https://www.npmjs.com/package/@openai/codex-sdk). Pick **Codex Agent** (or **Codex Agent (worktree)**) from the agent preset list when creating a terminal.
+Optional alternate agent backend powered by the [Codex app-server](https://developers.openai.com/codex/app-server), managed by the Rust host using the bundled `@openai/codex` runtime. Pick **Codex Agent** (or **Codex Agent (worktree)**) from the agent preset list when creating a terminal.
 
 - **GPT-5.5 / 5.4 / 5.3-codex / o4-mini / o3 / GPT-4.1** — Switch models inline; ChatGPT login or OpenAI API key
 - **Sandbox modes** — `read-only`, `workspace-write`, or `danger-full-access`
@@ -391,7 +391,7 @@ better-agent-terminal/
 - **Frontend:** React 18 + TypeScript + i18next (EN / zh-TW / zh-CN)
 - **Terminal:** xterm.js + node-pty
 - **Framework:** Tauri 2, with Rust as the host/runtime layer
-- **AI:** `@anthropic-ai/claude-agent-sdk` + bundled `@anthropic-ai/claude-code` binary (Claude); `@openai/codex-sdk` (Codex Agent)
+- **AI:** `@anthropic-ai/claude-agent-sdk` + bundled `@anthropic-ai/claude-code` binary (Claude); Rust-managed app-server from the bundled `@openai/codex` runtime (Codex Agent)
 - **Build:** Vite + Tauri
 - **Storage:** better-sqlite3 (snippets, session data)
 - **Remote:** Rust WebSocket server/client + QR code connection flow

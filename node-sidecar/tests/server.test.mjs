@@ -3453,6 +3453,10 @@ async function inProcess() {
   // off it and strips it before the request goes out, so a bare id runs at
   // 200K and puts a 300K compact target above the window it must fire below.
   assert.equal(sdkModelForClaudeSelection('claude-sonnet-4-6'), 'claude-sonnet-4-6[1m]')
+  assert.equal(sdkModelForClaudeSelection('claude-opus-5-5'), 'claude-opus-5-5[1m]')
+  assert.equal(sdkModelForClaudeSelection('claude-opus-5-5:auto-compact-200k'), 'claude-opus-5-5[1m]')
+  assert.equal(sdkModelForClaudeSelection('claude-opus-5-5:auto-compact-300k'), 'claude-opus-5-5[1m]')
+  assert.equal(sdkModelForClaudeSelection('claude-opus-5-5:1m'), 'claude-opus-5-5[1m]')
   assert.equal(sdkModelForClaudeSelection('claude-opus-5:auto-compact-200k'), 'claude-opus-5[1m]')
   assert.equal(sdkModelForClaudeSelection('claude-opus-5:auto-compact-300k'), 'claude-opus-5[1m]')
   assert.equal(sdkModelForClaudeSelection('claude-opus-5:1m'), 'claude-opus-5[1m]')
@@ -3750,8 +3754,7 @@ async function inProcess() {
   try {
     await dispatch({ jsonrpc: '2.0', id: 260, method: 'claude.startSession',
       params: { sessionId: 'abort-1', options: { cwd: '/x' } } })
-    // Kick off sendMessage but don't await yet — it'll block on the
-    // generator. abortSession needs to execute concurrently.
+    // sendMessage acknowledges receipt before the generator finishes.
     const sendPromise = dispatch({ jsonrpc: '2.0', id: 261, method: 'claude.sendMessage',
       params: { sessionId: 'abort-1', prompt: 'tell me a long story' } })
     // Wait long enough for a few chunks to stream so we KNOW the abort
@@ -3759,21 +3762,24 @@ async function inProcess() {
     await new Promise(r => setTimeout(r, 80))
     const beforeAbort = abortCaptured.length
     assert.ok(beforeAbort >= 2, `expected ≥2 events before abort, got ${beforeAbort}`)
+    const turnPromise = mod.sessions.get('abort-1').sendQueue
+    assert.ok(turnPromise, 'expected an active turn before abort')
     const abortReply = await dispatch({ jsonrpc: '2.0', id: 262, method: 'claude.abortSession',
       params: { sessionId: 'abort-1' } })
     assert.equal(abortReply.result.ok, true)
-    // sendMessage must complete promptly after abort — use a 1s ceiling
+    // The turn must complete promptly after abort — use a 1s ceiling
     // (much tighter than the 1.25s the fake SDK would otherwise run).
     const settled = await Promise.race([
-      sendPromise,
+      turnPromise,
       new Promise(r => setTimeout(() => r({ timedOut: true }), 1000)),
     ])
-    assert.ok(!settled.timedOut, 'sendMessage did not settle within 1s of abortSession')
+    assert.ok(!settled.timedOut, 'turn did not settle within 1s of abortSession')
+    await sendPromise
     // signal must have been propagated to the SDK so the fake iterator
     // saw .aborted=true.
     assert.ok(signalSeenByFakeSdk?.aborted, 'abort signal never reached the fake SDK iterator')
     // turn-end with reason:'aborted' must be present.
-    const turnEnd = abortCaptured.find(e => e.name === 'claude:turn-end')
+    const turnEnd = abortCaptured.find(e => e.name === 'claude:turn-end' && e.payload.sessionId === 'abort-1')
     assert.ok(turnEnd, 'expected claude:turn-end after abort')
     assert.equal(turnEnd.payload.payload.reason, 'aborted')
   } finally {
