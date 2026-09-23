@@ -53,8 +53,9 @@ function main() {
   // Fable 5.1 is the newest model and must stay at the top of the picker.
   assert.equal(rows[0].key, 'claude-fable-5-1', 'Fable 5.1 should be the first row')
   assert.equal(rows[0].label, 'Fable 5.1')
-  assert.equal(rows[1].key, 'claude-opus-5')
-  assert.equal(rows[2].key, 'claude-fable-5')
+  assert.equal(rows[1].key, 'claude-opus-5-5')
+  assert.equal(rows[2].key, 'claude-opus-5')
+  assert.equal(rows[3].key, 'claude-fable-5')
 
   // Every preset in the flat list must survive grouping exactly once, so no
   // model becomes unreachable from the picker.

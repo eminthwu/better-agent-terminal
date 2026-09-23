@@ -1587,6 +1587,13 @@ const CLAUDE_MODEL_TABLE: &[ClaudeModelDef] = &[
         description: None,
     },
     ClaudeModelDef {
+        id: "claude-opus-5-5",
+        label: "Opus 5.5",
+        context_window: 1_000_000,
+        windows: &[Some(200_000), Some(300_000), None],
+        description: None,
+    },
+    ClaudeModelDef {
         id: "claude-opus-5",
         label: "Opus 5",
         context_window: 1_000_000,
