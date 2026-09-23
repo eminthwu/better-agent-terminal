@@ -43,6 +43,12 @@ async function main() {
   assert.equal(displayNameForClaudeSelection('claude-opus-5:1m'), 'Opus 5 · 1M')
   for (const panelSource of [source, claudeSource]) {
     assert.match(panelSource, /'opus-5':\s+P\(5, 25\)/, 'Opus 5 pricing should be $5/$25 per MTok')
+    assert.ok(panelSource.includes("'opus-5-5': { ...P(4, 20), cacheRead: 0.20 }"),
+      'Opus 5.5 should use $4/$20 per MTok and $0.20 cache reads')
+    const opus55Match = panelSource.indexOf("if (model.includes('opus-5-5'))")
+    const opus5Match = panelSource.indexOf("if (model.includes('opus-5'))")
+    assert.ok(opus55Match >= 0 && opus55Match < opus5Match,
+      'Opus 5.5 must match before the overlapping Opus 5 prefix')
   }
 
   assert.equal(

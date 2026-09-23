@@ -50,12 +50,22 @@ function main() {
 
   const rows = groupClaudeModelRows(CLAUDE_BUILTIN_MODELS)
 
-  // Fable 5.1 is the newest model and must stay at the top of the picker.
-  assert.equal(rows[0].key, 'claude-fable-5-1', 'Fable 5.1 should be the first row')
-  assert.equal(rows[0].label, 'Fable 5.1')
-  assert.equal(rows[1].key, 'claude-opus-5-5')
+  // New releases lead the picker without removing earlier model selections.
+  assert.equal(rows[0].key, 'claude-opus-5-5', 'Opus 5.5 should be the first row')
+  assert.equal(rows[0].label, 'Opus 5.5')
+  assert.equal(rows[1].key, 'claude-fable-5-1')
   assert.equal(rows[2].key, 'claude-opus-5')
   assert.equal(rows[3].key, 'claude-fable-5')
+
+  const opus55 = rows[0]
+  assert.deepEqual(opus55.options.map(o => o.label), ['200K', '300K', '1M'])
+  for (const option of opus55.options) {
+    const sdkModel = sdkModelForClaudeSelection(option.value)
+    assert.equal(sdkModel, 'claude-opus-5-5[1m]')
+    assert.equal(contextWindowForClaudeSelection(option.value), 1_000_000)
+    assert.equal(claudeSelectionForModelAndWindow(sdkModel, option.window), option.value,
+      'host session metadata must restore the selected Opus 5.5 compact window')
+  }
 
   // Every preset in the flat list must survive grouping exactly once, so no
   // model becomes unreachable from the picker.
@@ -73,7 +83,7 @@ function main() {
     `expected fewer rows than presets, got ${rows.length} vs ${CLAUDE_BUILTIN_MODELS.length}`,
   )
 
-  const fable51 = rows[0]
+  const fable51 = rows[1]
   assert.deepEqual(
     fable51.options.map(o => o.label),
     ['200K', '300K', '1M'],
