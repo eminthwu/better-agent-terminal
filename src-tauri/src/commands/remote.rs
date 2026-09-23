@@ -191,6 +191,27 @@ pub async fn remote_connect(
     })?
 }
 
+/// Bind this window to its host-side target profile, opening a host profile
+/// context when that profile is itself remote (client -> host -> downstream).
+#[tauri::command]
+pub async fn remote_attach_profile(
+    window: WebviewWindow,
+    client_state: State<'_, RustRemoteClientState>,
+    profile_id: String,
+) -> Result<Value, BridgeError> {
+    let state = (*client_state).clone();
+    let window_label = window.label().to_string();
+    crate::async_rt::spawn_blocking(move || {
+        Ok(state
+            .attach_profile(&window_label, &profile_id)
+            .unwrap_or_else(|error| json!({ "chained": false, "error": error })))
+    })
+    .await
+    .map_err(|err| BridgeError {
+        message: format!("remote.attachProfile worker failed: {err}"),
+    })?
+}
+
 #[tauri::command]
 pub async fn remote_disconnect(
     window: WebviewWindow,

@@ -709,6 +709,23 @@ export default function App() {
             // to the local windowId branch (see workspace-store.listenForReload).
             workspaceStore.setViewedRemoteProfileId(active.remoteProfileId || 'default')
             workspaceStore.setViewedRemoteOrigin(dialOrigin)
+            // When the target is itself a remote profile on this host (e.g. a
+            // host that reaches another machine through its own tunnel), the
+            // host proxies this window to that downstream host. Without the
+            // attach the host would serve its own empty snapshot of the alias.
+            const attach = await host.remote.attachProfile(remoteProfileId)
+            if (attach?.error) {
+              dlog(`[init] remote.attachProfile failed host=${dialOrigin} profile=${remoteProfileId} error=${attach.error}`)
+              setProfileStartup({
+                phase: 'error',
+                target: remoteStartupTarget,
+                message: t('app.remoteConnectionFailed', { error: attach.error }),
+              })
+              return
+            }
+            if (attach?.chained) {
+              dlog(`[init] remote profile ${remoteProfileId} is chained through ${dialOrigin}`)
+            }
             const winIdx = await host.app.getWindowIndex()
             // Show the HOST-side target profile name when we have it (persisted on
             // the alias at selection time) so the title/sidebar reflect which
@@ -933,6 +950,12 @@ export default function App() {
           // The profile may have been torn down (deleted / made unavailable)
           // while this dial was in flight — don't resurrect a zombie session.
           if (!disposed && !remoteUnavailableRef.current && activeProfileIsRemoteRef.current) {
+            // Re-bind the (possibly chained) target profile on the new socket;
+            // a failure here resurfaces on the next invoke, which retries it.
+            const attach = await host.remote.attachProfile(activeRemoteProfileIdRef.current || 'default').catch(() => null)
+            if (attach?.error) {
+              void host.debug.log(`[remote] reconnect attachProfile failed profile=${activeRemoteProfileIdRef.current || 'default'} error=${attach.error}`)
+            }
             setRemoteClientConnected(true)
             // Re-attach: pull canonical host-owned workspace/session state back,
             // but keep the workspace the user was on (don't jump to the host's

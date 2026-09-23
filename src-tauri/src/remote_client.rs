@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::client::IntoClientRequest;
@@ -54,6 +54,29 @@ pub struct RustRemoteClientState {
     bindings: Arc<Mutex<HashMap<String, ConnectionKey>>>,
     next_id: Arc<AtomicU64>,
     event_sink: Option<RemoteEventSink>,
+    // Windows whose host-side target profile is itself a remote profile
+    // (client -> host -> downstream host). Their invokes ride a host-side
+    // profile context (`profile:open`), which proxies them to the downstream
+    // host instead of serving the host's own (empty) snapshot of the alias.
+    chains: Arc<Mutex<HashMap<String, ChainedProfile>>>,
+    // Serializes context (re)opens so concurrent invokes after a reconnect
+    // cannot open duplicate contexts that would double-deliver events.
+    attach_lock: Arc<Mutex<()>>,
+}
+
+struct ChainedProfile {
+    // Host-side profile id the window targets (the alias of the downstream).
+    profile_id: String,
+    // Connection the context was opened on. A context dies with its socket,
+    // so a context recorded against another (older) connection is stale.
+    client: Weak<RunningClient>,
+    context_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct ContextRoute {
+    window: String,
+    profile_id: String,
 }
 
 pub type RemoteEventSink = Arc<dyn Fn(&str, Value) + Send + Sync>;
@@ -114,6 +137,9 @@ struct RunningClient {
     // Global host events still fan out to every referrer; high-volume
     // resource events wake only the window that most recently used it.
     event_owners: Arc<Mutex<HashMap<String, String>>>,
+    // Host profile contexts opened on this connection: contextId -> the window
+    // that owns it. Context-scoped events are delivered only to that window.
+    context_routes: Arc<Mutex<HashMap<String, ContextRoute>>>,
 }
 
 enum ClientCommand {
@@ -122,6 +148,7 @@ enum ClientCommand {
         channel: String,
         args: Vec<Value>,
         params: Option<Value>,
+        context_id: Option<String>,
         timeout: Duration,
         reply: mpsc::Sender<Result<Value, String>>,
     },
@@ -276,6 +303,8 @@ impl RustRemoteClientState {
                     let referrers_for_loop = Arc::clone(&referrers);
                     let event_owners = Arc::new(Mutex::new(HashMap::new()));
                     let event_owners_for_loop = Arc::clone(&event_owners);
+                    let context_routes = Arc::new(Mutex::new(HashMap::new()));
+                    let context_routes_for_loop = Arc::clone(&context_routes);
                     let remote_origin = format!("{host}:{port}");
                     let event_sink = self.event_sink.clone();
                     thread::spawn(move || {
@@ -288,6 +317,7 @@ impl RustRemoteClientState {
                             remote_origin,
                             referrers_for_loop,
                             event_owners_for_loop,
+                            context_routes_for_loop,
                             event_sink,
                         )
                     });
@@ -302,6 +332,7 @@ impl RustRemoteClientState {
                         tx,
                         referrers,
                         event_owners,
+                        context_routes,
                     });
                     client
                 })
@@ -382,8 +413,13 @@ impl RustRemoteClientState {
             .get(&key)
             .cloned();
         let Some(client) = client else {
+            self.chains
+                .lock()
+                .expect("remote client chains lock")
+                .remove(window_label);
             return true;
         };
+        self.drop_chain(window_label);
         let now_empty = {
             let mut referrers = client
                 .referrers
@@ -472,9 +508,29 @@ impl RustRemoteClientState {
         if channel.trim().is_empty() {
             return Err("remote.invoke: channel is required".to_string());
         }
-        // Route strictly to this window's own connection. If the window has no
-        // live binding, fail closed — never fall back to another window's/host's
-        // connection (that was the cross-host bleed bug).
+        let client = self.bound_client(window_label)?;
+        if let Some(resource) = event_owner_key_for_invoke(channel, &args) {
+            let mut owners = client
+                .event_owners
+                .lock()
+                .expect("remote client event owners lock");
+            if owners.len() >= EVENT_OWNER_LIMIT && !owners.contains_key(&resource) {
+                owners.clear();
+            }
+            owners.insert(resource, window_label.to_string());
+        }
+        let context_id = if routes_through_profile_context(channel) {
+            self.context_for(window_label, &client)?
+        } else {
+            None
+        };
+        self.send_invoke(&client, channel, args, params, context_id, timeout)
+    }
+
+    /// Route strictly to this window's own connection. If the window has no
+    /// live binding, fail closed — never fall back to another window's/host's
+    /// connection (that was the cross-host bleed bug).
+    fn bound_client(&self, window_label: &str) -> Result<Arc<RunningClient>, String> {
         let key = self
             .bindings
             .lock()
@@ -496,31 +552,207 @@ impl RustRemoteClientState {
         if !client.connected.load(Ordering::SeqCst) {
             return Err("remote.invoke: not connected to remote server".to_string());
         }
-        if let Some(resource) = event_owner_key_for_invoke(channel, &args) {
-            let mut owners = client
-                .event_owners
-                .lock()
-                .expect("remote client event owners lock");
-            if owners.len() >= EVENT_OWNER_LIMIT && !owners.contains_key(&resource) {
-                owners.clear();
-            }
-            owners.insert(resource, window_label.to_string());
-        }
-        let tx = client.tx.clone();
-        let id = self.next_id();
+        Ok(client)
+    }
+
+    fn send_invoke(
+        &self,
+        client: &RunningClient,
+        channel: &str,
+        args: Vec<Value>,
+        params: Option<Value>,
+        context_id: Option<String>,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        tx.send(ClientCommand::Invoke {
-            id,
-            channel: channel.to_string(),
-            args,
-            params,
-            timeout,
-            reply: reply_tx,
-        })
-        .map_err(|_| "remote.invoke: connection closed".to_string())?;
+        client
+            .tx
+            .send(ClientCommand::Invoke {
+                id: self.next_id(),
+                channel: channel.to_string(),
+                args,
+                params,
+                context_id,
+                timeout,
+                reply: reply_tx,
+            })
+            .map_err(|_| "remote.invoke: connection closed".to_string())?;
         reply_rx
             .recv_timeout(timeout + PENDING_REPLY_GRACE)
             .map_err(|_| format!("Remote invoke timeout: {channel}"))?
+    }
+
+    /// Fire-and-forget invoke for best-effort cleanup (the reply is dropped).
+    fn send_detached(&self, client: &RunningClient, channel: &str, params: Value) {
+        let (reply_tx, _reply_rx) = mpsc::channel();
+        let _ = client.tx.send(ClientCommand::Invoke {
+            id: self.next_id(),
+            channel: channel.to_string(),
+            args: Vec::new(),
+            params: Some(params),
+            context_id: None,
+            timeout: INVOKE_TIMEOUT,
+            reply: reply_tx,
+        });
+    }
+
+    /// Bind a window to its host-side target profile. When that profile is
+    /// itself a remote profile on the host (client -> host -> downstream), open
+    /// a host profile context so the window's invokes and events are proxied to
+    /// the downstream host; otherwise the window keeps talking to the host
+    /// directly, exactly as before. Call after every successful `connect`.
+    pub fn attach_profile(&self, window_label: &str, profile_id: &str) -> Result<Value, String> {
+        let client = self.bound_client(window_label)?;
+        let _guard = self.attach_lock.lock().expect("remote client attach lock");
+        self.drop_chain(window_label);
+        let listing = self.send_invoke(
+            &client,
+            "profile:list",
+            Vec::new(),
+            None,
+            None,
+            INVOKE_TIMEOUT,
+        )?;
+        let target_is_remote = listing
+            .get("profiles")
+            .and_then(Value::as_array)
+            .and_then(|profiles| profiles.iter().find(|p| p["id"] == profile_id))
+            .is_some_and(|profile| profile["type"] == "remote");
+        if !target_is_remote {
+            return Ok(json!({ "chained": false }));
+        }
+        let context_id = self.open_context(window_label, &client, profile_id)?;
+        Ok(json!({ "chained": true, "contextId": context_id }))
+    }
+
+    /// The live context id for a chained window, reopening it when the one on
+    /// record died (socket replaced by a reconnect, or the host reported the
+    /// downstream unavailable). None for windows that are not chained.
+    fn context_for(
+        &self,
+        window_label: &str,
+        client: &Arc<RunningClient>,
+    ) -> Result<Option<String>, String> {
+        if !self
+            .chains
+            .lock()
+            .expect("remote client chains lock")
+            .contains_key(window_label)
+        {
+            return Ok(None);
+        }
+        let _guard = self.attach_lock.lock().expect("remote client attach lock");
+        let profile_id = {
+            let chains = self.chains.lock().expect("remote client chains lock");
+            // Detached while waiting for the lock: talk to the host directly.
+            let Some(chain) = chains.get(window_label) else {
+                return Ok(None);
+            };
+            let live = chain
+                .client
+                .upgrade()
+                .is_some_and(|recorded| Arc::ptr_eq(&recorded, client));
+            if let Some(id) = chain.context_id.as_ref().filter(|_| live) {
+                if client
+                    .context_routes
+                    .lock()
+                    .expect("remote client context routes lock")
+                    .contains_key(id)
+                {
+                    return Ok(Some(id.clone()));
+                }
+            }
+            chain.profile_id.clone()
+        };
+        self.open_context(window_label, client, &profile_id)
+            .map(Some)
+    }
+
+    fn open_context(
+        &self,
+        window_label: &str,
+        client: &Arc<RunningClient>,
+        profile_id: &str,
+    ) -> Result<String, String> {
+        let previous = self
+            .chains
+            .lock()
+            .expect("remote client chains lock")
+            .get(window_label)
+            .filter(|chain| {
+                chain
+                    .client
+                    .upgrade()
+                    .is_some_and(|recorded| Arc::ptr_eq(&recorded, client))
+            })
+            .and_then(|chain| chain.context_id.clone());
+        let opened = self.send_invoke(
+            client,
+            "profile:open",
+            Vec::new(),
+            Some(json!({ "profileId": profile_id })),
+            None,
+            INVOKE_TIMEOUT,
+        )?;
+        let context_id = opened
+            .get("contextId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "host did not return a profile context".to_string())?
+            .to_string();
+        {
+            let mut routes = client
+                .context_routes
+                .lock()
+                .expect("remote client context routes lock");
+            routes.retain(|_, route| route.window != window_label);
+            routes.insert(
+                context_id.clone(),
+                ContextRoute {
+                    window: window_label.to_string(),
+                    profile_id: profile_id.to_string(),
+                },
+            );
+        }
+        self.chains
+            .lock()
+            .expect("remote client chains lock")
+            .insert(
+                window_label.to_string(),
+                ChainedProfile {
+                    profile_id: profile_id.to_string(),
+                    client: Arc::downgrade(client),
+                    context_id: Some(context_id.clone()),
+                },
+            );
+        // A dead context still occupies one of the host's per-connection slots
+        // until it is explicitly closed.
+        if let Some(previous) = previous.filter(|previous| *previous != context_id) {
+            self.send_detached(client, "profile:close", json!({ "contextId": previous }));
+        }
+        Ok(context_id)
+    }
+
+    /// Forget a window's chained profile and release its host-side context.
+    fn drop_chain(&self, window_label: &str) {
+        let Some(chain) = self
+            .chains
+            .lock()
+            .expect("remote client chains lock")
+            .remove(window_label)
+        else {
+            return;
+        };
+        let (Some(client), Some(context_id)) = (chain.client.upgrade(), chain.context_id) else {
+            return;
+        };
+        client
+            .context_routes
+            .lock()
+            .expect("remote client context routes lock")
+            .remove(&context_id);
+        if client.connected.load(Ordering::SeqCst) {
+            self.send_detached(&client, "profile:close", json!({ "contextId": context_id }));
+        }
     }
 
     pub fn test_connection(
@@ -604,6 +836,14 @@ fn event_owner_key(kind: &str, id: Option<&str>) -> Option<String> {
         .map(|id| format!("{kind}:{id}"))
 }
 
+/// Host profile contexts refuse `profile:*` and `app:*` (those manage the
+/// connection to the host itself), so chained windows send them to the host
+/// directly; everything else is proxied to the downstream host.
+fn routes_through_profile_context(channel: &str) -> bool {
+    let channel = canonical_remote_channel(channel);
+    !(channel.starts_with("profile:") || channel.starts_with("app:"))
+}
+
 fn event_owner_key_for_invoke(channel: &str, args: &[Value]) -> Option<String> {
     let channel = canonical_remote_channel(channel);
     if channel == "pty:create" {
@@ -657,6 +897,7 @@ fn client_loop(
     remote_origin: String,
     referrers: Arc<Mutex<HashSet<String>>>,
     event_owners: Arc<Mutex<HashMap<String, String>>>,
+    context_routes: Arc<Mutex<HashMap<String, ContextRoute>>>,
     event_sink: Option<RemoteEventSink>,
 ) {
     let mut pending: HashMap<String, PendingInvoke> = HashMap::new();
@@ -682,6 +923,7 @@ fn client_loop(
                     channel,
                     args,
                     params,
+                    context_id,
                     timeout,
                     reply,
                 } => {
@@ -690,6 +932,9 @@ fn client_loop(
                         json!({ "type": "invoke", "id": id, "channel": channel, "args": args });
                     if let Some(params) = params {
                         frame["params"] = params;
+                    }
+                    if let Some(context_id) = context_id {
+                        frame["contextId"] = Value::String(context_id);
                     }
                     match send_json_frame(&mut ws, frame, compression) {
                         Ok(()) => {
@@ -734,6 +979,7 @@ fn client_loop(
                             &remote_origin,
                             &referrers,
                             &event_owners,
+                            &context_routes,
                             event_sink.as_ref(),
                         );
                     }
@@ -756,6 +1002,7 @@ fn client_loop(
                             &remote_origin,
                             &referrers,
                             &event_owners,
+                            &context_routes,
                             event_sink.as_ref(),
                         );
                     }
@@ -851,6 +1098,7 @@ fn handle_frame(
     remote_origin: &str,
     referrers: &Mutex<HashSet<String>>,
     event_owners: &Mutex<HashMap<String, String>>,
+    context_routes: &Mutex<HashMap<String, ContextRoute>>,
     event_sink: Option<&RemoteEventSink>,
 ) {
     let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("");
@@ -877,6 +1125,19 @@ fn handle_frame(
             return;
         };
         let channel = canonical_remote_channel(raw_channel);
+        if let Some(context_id) = frame.get("contextId").and_then(Value::as_str) {
+            if event_sink.is_none() {
+                handle_context_event(
+                    app,
+                    &frame,
+                    context_id,
+                    &channel,
+                    remote_origin,
+                    context_routes,
+                );
+            }
+            return;
+        }
         if !is_proxied_remote_event(&channel) {
             return;
         }
@@ -914,9 +1175,85 @@ fn handle_frame(
             .filter(|owner| all_windows.contains(owner))
             .map(|owner| vec![owner])
             .unwrap_or(all_windows);
+        // Chained windows view a downstream host: this host's own sessions,
+        // terminals and workspace reloads are not theirs. Their resource events
+        // arrive context-scoped instead (handle_context_event).
+        if channel.starts_with("pty:")
+            || channel.starts_with("claude:")
+            || channel == "workspace:reload"
+        {
+            let chained = context_routes
+                .lock()
+                .expect("remote client context routes lock")
+                .values()
+                .map(|route| route.window.clone())
+                .collect::<HashSet<_>>();
+            windows.retain(|window| !chained.contains(window));
+        }
         windows.sort();
         publish_runtime_event_to_windows(app, &windows, &channel, params, "rust-remote-client");
     }
+}
+
+/// Deliver an event the host scoped to one profile context to the window that
+/// owns the context. Stale or foreign context ids are dropped.
+fn handle_context_event(
+    app: &HostContext,
+    frame: &Value,
+    context_id: &str,
+    channel: &str,
+    remote_origin: &str,
+    context_routes: &Mutex<HashMap<String, ContextRoute>>,
+) {
+    let Some(route) = context_routes
+        .lock()
+        .expect("remote client context routes lock")
+        .get(context_id)
+        .cloned()
+    else {
+        return;
+    };
+    let params = frame.get("params").cloned().unwrap_or(Value::Null);
+    if channel == "profile:status" {
+        if params.get("status").and_then(Value::as_str) != Some("unavailable") {
+            return;
+        }
+        // The host lost the downstream. Forget the context and ask the window
+        // to reload: its workspace:load reopens a fresh context (reconnecting
+        // the downstream) and re-subscribes its sessions and terminals.
+        context_routes
+            .lock()
+            .expect("remote client context routes lock")
+            .remove(context_id);
+        crate::commands::app::log_tauri(
+            app,
+            &format!(
+                "[remote-client] profile context unavailable window={} profile={}",
+                route.window, route.profile_id
+            ),
+        );
+        let reload = tag_remote_workspace_reload(
+            json!({ "profileId": route.profile_id, "refresh": true }),
+            remote_origin,
+        );
+        publish_runtime_event_to_windows(
+            app,
+            &[route.window],
+            "workspace:reload",
+            reload,
+            "rust-remote-client",
+        );
+        return;
+    }
+    if !is_proxied_remote_event(channel) {
+        return;
+    }
+    let params = match channel {
+        "workspace:reload" => tag_remote_workspace_reload(params, remote_origin),
+        "profile:changed" => tag_remote_profile_changed(params, remote_origin),
+        _ => params,
+    };
+    publish_runtime_event_to_windows(app, &[route.window], channel, params, "rust-remote-client");
 }
 
 fn expire_pending(pending: &mut HashMap<String, PendingInvoke>) {
@@ -1538,6 +1875,7 @@ mod tests {
             tx,
             referrers: Arc::new(Mutex::new(HashSet::new())),
             event_owners: Arc::new(Mutex::new(HashMap::new())),
+            context_routes: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1586,6 +1924,181 @@ mod tests {
         let replacement = state.get_or_insert_live_client(&key, fake_client);
         assert!(!Arc::ptr_eq(&old, &replacement));
         assert!(replacement.connected.load(Ordering::SeqCst));
+    }
+
+    type SentFrames = Arc<Mutex<Vec<(String, Option<String>, Value)>>>;
+
+    // A fake pooled connection whose command channel is served by a stub host
+    // thread, so invoke/attach behavior can be asserted end to end.
+    fn stub_host_client(
+        state: &RustRemoteClientState,
+        windows: &[&str],
+    ) -> (Arc<RunningClient>, SentFrames) {
+        let (tx, rx) = mpsc::channel::<ClientCommand>();
+        let client = Arc::new(RunningClient {
+            host: "host".to_string(),
+            port: 9001,
+            compression: RemoteCompression::None,
+            protocol: "v2".to_string(),
+            server_version: None,
+            capabilities: None,
+            connected: Arc::new(AtomicBool::new(true)),
+            tx,
+            referrers: Arc::new(Mutex::new(HashSet::new())),
+            event_owners: Arc::new(Mutex::new(HashMap::new())),
+            context_routes: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let key = ConnectionKey::new("host", 9001, "tok");
+        state
+            .pool
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::clone(&client));
+        for window in windows {
+            client
+                .referrers
+                .lock()
+                .unwrap()
+                .insert((*window).to_string());
+            state
+                .bindings
+                .lock()
+                .unwrap()
+                .insert((*window).to_string(), key.clone());
+        }
+        let sent: SentFrames = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&sent);
+        thread::spawn(move || {
+            let mut opened = 0;
+            while let Ok(command) = rx.recv() {
+                let ClientCommand::Invoke {
+                    channel,
+                    params,
+                    context_id,
+                    reply,
+                    ..
+                } = command
+                else {
+                    continue;
+                };
+                log.lock().unwrap().push((
+                    channel.clone(),
+                    context_id,
+                    params.clone().unwrap_or(Value::Null),
+                ));
+                let result = match channel.as_str() {
+                    "profile:list" => json!({ "profiles": [
+                        { "id": "default", "type": "local" },
+                        { "id": "ap01", "type": "remote" },
+                    ] }),
+                    "profile:open" => {
+                        opened += 1;
+                        json!({ "contextId": format!("pc-{opened}"), "status": "ready" })
+                    }
+                    _ => json!("ok"),
+                };
+                let _ = reply.send(Ok(result));
+            }
+        });
+        (client, sent)
+    }
+
+    fn sent_for(sent: &SentFrames, channel: &str) -> Vec<(Option<String>, Value)> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _, _)| c == channel)
+            .map(|(_, context, params)| (context.clone(), params.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn chained_profiles_ride_a_host_profile_context() {
+        let state = RustRemoteClientState::default();
+        let (client, sent) = stub_host_client(&state, &["win-chained", "win-direct"]);
+        let timeout = Duration::from_secs(5);
+
+        // A local target stays a direct connection; a remote target opens a context.
+        let direct = state.attach_profile("win-direct", "default").unwrap();
+        assert_eq!(direct, json!({ "chained": false }));
+        let chained = state.attach_profile("win-chained", "ap01").unwrap();
+        assert_eq!(chained, json!({ "chained": true, "contextId": "pc-1" }));
+        assert_eq!(
+            sent_for(&sent, "profile:open"),
+            vec![(None, json!({ "profileId": "ap01" }))]
+        );
+
+        // Workload channels carry the context; host-management channels and
+        // direct windows do not.
+        state
+            .invoke(
+                "win-chained",
+                "workspace:load",
+                vec![json!("ap01")],
+                timeout,
+            )
+            .unwrap();
+        state
+            .invoke("win-chained", "profile:list", vec![], timeout)
+            .unwrap();
+        state
+            .invoke(
+                "win-direct",
+                "workspace:load",
+                vec![json!("default")],
+                timeout,
+            )
+            .unwrap();
+        let loads = sent_for(&sent, "workspace:load");
+        assert_eq!(loads[0].0.as_deref(), Some("pc-1"));
+        assert_eq!(loads[1].0, None);
+        assert!(sent_for(&sent, "profile:list")
+            .iter()
+            .all(|(context, _)| context.is_none()));
+
+        // The host reported the downstream unavailable (route dropped): the next
+        // invoke reopens a fresh context and releases the dead one's slot.
+        client.context_routes.lock().unwrap().remove("pc-1");
+        state
+            .invoke(
+                "win-chained",
+                "pty:write",
+                vec![json!("t1"), json!("x")],
+                timeout,
+            )
+            .unwrap();
+        assert_eq!(sent_for(&sent, "pty:write")[0].0.as_deref(), Some("pc-2"));
+        assert_eq!(
+            sent_for(&sent, "profile:close"),
+            vec![(None, json!({ "contextId": "pc-1" }))]
+        );
+
+        // Disconnecting the chained window releases its context but keeps the
+        // shared socket for the direct sibling.
+        assert!(state.disconnect("win-chained"));
+        state
+            .invoke(
+                "win-direct",
+                "workspace:load",
+                vec![json!("default")],
+                timeout,
+            )
+            .unwrap();
+        assert_eq!(
+            sent_for(&sent, "profile:close").last().cloned(),
+            Some((None, json!({ "contextId": "pc-2" })))
+        );
+        assert!(client.context_routes.lock().unwrap().is_empty());
+        assert!(state.chains.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn host_management_channels_bypass_profile_contexts() {
+        assert!(routes_through_profile_context("workspace:load"));
+        assert!(routes_through_profile_context("agent:send-message"));
+        assert!(routes_through_profile_context("pty:create"));
+        assert!(!routes_through_profile_context("profile:list"));
+        assert!(!routes_through_profile_context("app:get-version"));
     }
 
     fn register_fake_client(state: &RustRemoteClientState, windows: &[&str]) -> ConnectionKey {

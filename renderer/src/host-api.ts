@@ -1546,6 +1546,10 @@ function createTauriHost(): BatAppAPI {
       rotateToken: () => getInvoke()<unknown>('remote_rotate_token'),
       connect: (host: string, port: number, token: string, fingerprint: string, label?: string) =>
         getInvoke()<unknown>('remote_connect', { host, port, token, fingerprint, label }),
+      // Must follow every successful connect: when the host-side target
+      // profile is itself remote, the host proxies this window to it.
+      attachProfile: (profileId: string) =>
+        getInvoke()<{ chained?: boolean; contextId?: string; error?: string }>('remote_attach_profile', { profileId }),
       disconnect: () => getInvoke()<unknown>('remote_disconnect'),
       clientStatus: () =>
         getInvoke()<{
