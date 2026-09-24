@@ -537,7 +537,7 @@ fn codex_context_window_for_model(model: &str) -> u64 {
     match codex_base_model(model) {
         // The app-server reports the authoritative value in token usage updates.
         // Keep this fallback accurate before the first update arrives.
-        "gpt-6-astra" => GPT_6_ASTRA_CONTEXT_WINDOW_FALLBACK,
+        "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna" => GPT_6_ASTRA_CONTEXT_WINDOW_FALLBACK,
         "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => GPT_5_6_CONTEXT_WINDOW_FALLBACK,
         "gpt-5.5"
         | "gpt-5.4"
@@ -2791,6 +2791,8 @@ impl CodexAppServerState {
             json!({ "value": "gpt-6-astra", "displayName": "GPT-6 Astra", "description": "Most capable - complex, demanding work", "source": "builtin" }),
             json!({ "value": "gpt-6-astra:272k", "displayName": "GPT-6 Astra (272K)", "description": "GPT-6 Astra - 272K context window", "source": "builtin" }),
             json!({ "value": "gpt-6-astra:872k", "displayName": "GPT-6 Astra (872K)", "description": "GPT-6 Astra - 872K context window", "source": "builtin" }),
+            json!({ "value": "gpt-6-sol", "displayName": "GPT-6 Sol", "description": "Workhorse - coding and everyday work", "source": "builtin" }),
+            json!({ "value": "gpt-6-luna", "displayName": "GPT-6 Luna", "description": "Fast and affordable - easier tasks", "source": "builtin" }),
             json!({ "value": "gpt-5.6-sol", "displayName": "GPT-5.6 Sol", "description": "Flagship - complex, open-ended work", "source": "builtin" }),
             json!({ "value": "gpt-5.6-terra", "displayName": "GPT-5.6 Terra", "description": "Balanced - everyday workhorse", "source": "builtin" }),
             json!({ "value": "gpt-5.6-luna", "displayName": "GPT-5.6 Luna", "description": "Fast - clear, repeatable work", "source": "builtin" }),
@@ -8078,6 +8080,14 @@ mod tests {
         assert_eq!(codex_context_window_for_model("gpt-6-astra:872k"), 872_000);
         assert_eq!(
             codex_context_window_for_model("gpt-6-astra"),
+            GPT_6_ASTRA_CONTEXT_WINDOW_FALLBACK
+        );
+        assert_eq!(
+            codex_context_window_for_model("gpt-6-sol"),
+            GPT_6_ASTRA_CONTEXT_WINDOW_FALLBACK
+        );
+        assert_eq!(
+            codex_context_window_for_model("gpt-6-luna"),
             GPT_6_ASTRA_CONTEXT_WINDOW_FALLBACK
         );
     }
