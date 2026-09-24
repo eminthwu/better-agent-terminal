@@ -366,6 +366,10 @@ const ClaudeAgentPanelContent = memo(function ClaudeAgentPanelContent({ sessionI
     const t = workspaceStore.getState().terminals.find(t => t.id === sessionId)
     return normalizeClaudeModelSelection(t?.model || settingsStore.getSettings().defaultClaudeModel) || ''
   })
+  // Read by long-lived event handlers (registered once per session) so they
+  // see the live remote flag instead of the value captured at subscription.
+  const isRemoteConnectedRef = useRef(isRemoteConnected)
+  isRemoteConnectedRef.current = isRemoteConnected
   const [codexSandboxMode, setCodexSandboxMode] = useState<CodexSandboxMode>(() => {
     const value = normalizedAgentParams?.sandboxMode
     return value === 'read-only' || value === 'workspace-write' || value === 'danger-full-access'
@@ -1706,7 +1710,14 @@ const ClaudeAgentPanelContent = memo(function ClaudeAgentPanelContent({ sessionI
             }
           }
         }
-        if (m.model) setCurrentModel(prev => prev || claudeSelectionForModelAndWindow(m.model, m.autoCompactWindow) || m.model!)
+        if (m.model) {
+          const hostModel = claudeSelectionForModelAndWindow(m.model, m.autoCompactWindow) || m.model
+          // Remote mode is host-owned: a status update carries the model the host
+          // session actually ran with, so adopt it even when a (possibly stale)
+          // local value is already set. Locally keep our own value to avoid
+          // racing an in-flight change the host hasn't applied yet.
+          setCurrentModel(prev => isRemoteConnectedRef.current ? hostModel : (prev || hostModel))
+        }
         // The sidecar downgrades effort server-side when the CLI rejects the
         // current level for the account's plan (e.g. 'max' needs API billing).
         // Reflect that here so the dropdown does not keep showing a level the
