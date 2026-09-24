@@ -21,6 +21,8 @@ export const CODEX_MODELS: CodexModelInfo[] = [
   { value: 'gpt-6-astra', displayName: 'GPT-6 Astra', description: 'Most capable · complex, demanding work' },
   { value: 'gpt-6-astra:272k', displayName: 'GPT-6 Astra (272K)', description: 'GPT-6 Astra · 272K context window' },
   { value: 'gpt-6-astra:872k', displayName: 'GPT-6 Astra (872K)', description: 'GPT-6 Astra · 872K context window' },
+  { value: 'gpt-6-sol', displayName: 'GPT-6 Sol', description: 'Workhorse · coding and everyday work' },
+  { value: 'gpt-6-luna', displayName: 'GPT-6 Luna', description: 'Fast and affordable · easier tasks' },
   { value: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol', description: 'Flagship · complex, open-ended work' },
   { value: 'gpt-5.6-terra', displayName: 'GPT-5.6 Terra', description: 'Balanced · everyday workhorse' },
   { value: 'gpt-5.6-luna', displayName: 'GPT-5.6 Luna', description: 'Fast · clear, repeatable work' },
