@@ -18,9 +18,9 @@ import {
 function main() {
   assert.equal(DEFAULT_CODEX_MODEL, 'gpt-5.6-sol')
   assert.deepEqual(
-    CODEX_MODELS.slice(0, 5).map(model => model.value),
-    ['gpt-6-astra', 'gpt-6-astra:272k', 'gpt-6-astra:872k', 'gpt-5.6-sol', 'gpt-5.6-terra'],
-    'the Codex picker should lead with GPT-6 Astra and its context-window presets, then the GPT-5.6 family',
+    CODEX_MODELS.slice(0, 7).map(model => model.value),
+    ['gpt-6-astra', 'gpt-6-astra:272k', 'gpt-6-astra:872k', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra'],
+    'the Codex picker should lead with the GPT-6 family, then the GPT-5.6 family',
   )
   assert.ok(CODEX_MODELS.every(model => typeof model.description === 'string' && model.description.length > 0))
 
@@ -37,7 +37,9 @@ function main() {
     codexRows[0].options.map(option => [option.label, option.value, option.contextWindow]),
     [['Default', 'gpt-6-astra', null], ['272K', 'gpt-6-astra:272k', 272_000], ['872K', 'gpt-6-astra:872k', 872_000]],
   )
-  assert.equal(codexRows[1].key, 'gpt-5.6-sol')
+  assert.equal(codexRows[1].key, 'gpt-6-sol')
+  assert.equal(codexRows[2].key, 'gpt-6-luna')
+  assert.equal(codexRows[3].key, 'gpt-5.6-sol')
   assert.deepEqual(codexRows.slice(1).map(row => row.options.length), codexRows.slice(1).map(() => 0),
     'only the Astra row carries window pills')
   assert.equal(codexRows.length, CODEX_MODELS.length - 2, 'Astra presets collapse into a single row')
@@ -46,7 +48,7 @@ function main() {
   assert.equal(codexModelValueForRow(codexRows[0], 872_000), 'gpt-6-astra:872k', 'carry the window when the row offers it')
   assert.equal(codexModelValueForRow(codexRows[0], undefined), 'gpt-6-astra', 'no carried window → Default pill')
   assert.equal(codexModelValueForRow(codexRows[0], null), 'gpt-6-astra')
-  assert.equal(codexModelValueForRow(codexRows[1], 872_000), 'gpt-5.6-sol', 'plain rows ignore the carried window')
+  assert.equal(codexModelValueForRow(codexRows[1], 872_000), 'gpt-6-sol', 'plain rows ignore the carried window')
 
   const rows = groupClaudeModelRows(CLAUDE_BUILTIN_MODELS)
 
